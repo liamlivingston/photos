@@ -1,3 +1,3 @@
 #!/bin/bash
 git pull origin main
-rclone sync gdrive:photos-lfs .git/lfs/objects -P
+rclone sync gdrive:photos-lfs photos/ -P
