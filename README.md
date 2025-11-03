@@ -40,7 +40,7 @@ rclone config
 
 When prompted:
 * Choose `n` for New remote.
-* Name it: `photos-lfs`
+* Name it: `gdrive`
 * Select `drive` as the storage backend.
 * Follow the OAuth link to authorize rclone with your Google account.
 * Accept defaults for the rest unless you need specific options.
