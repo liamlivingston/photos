@@ -1,0 +1,9 @@
+.git/lfs/objects/
+*.jpg
+*.JPG
+*.jpeg
+*.JPEG
+*.NEF
+*.nef
+*.RW2
+*.rw2
