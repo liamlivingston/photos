@@ -1,3 +1,2 @@
-#!/bin/bash
-git push origin main
+#!/bin/bashy
 rclone sync photos/ gdrive:photos-lfs -P
