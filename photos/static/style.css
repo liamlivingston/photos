@@ -1,0 +1,154 @@
+body {
+    background-color: #1a1a1a;
+    margin: 0;
+    padding: 0;
+    overflow-x: hidden;
+    /* Prevent scrolling when lightbox is open */
+}
+
+.gallery-container {
+    width: 100%;
+}
+
+.gallery-row {
+    display: flex;
+    width: 100%;
+}
+
+.gallery-row img {
+    flex-grow: 1;
+    flex-basis: 0;
+    height: auto;
+    width: 0;
+    display: block;
+    object-fit: cover;
+    /* Add cursor pointer to show it's clickable */
+    cursor: pointer;
+}
+
+.img-horizontal {
+    aspect-ratio: 1.41421 / 1; 
+}
+
+.img-vertical {
+    aspect-ratio: 1 / 1.41421;
+}
+
+/* --- NEW: Lightbox Styles --- */
+
+#lightbox-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.9);
+    z-index: 100;
+    
+    /* Hide by default */
+    display: none;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+}
+
+#lightbox-overlay.show {
+    display: block;
+    opacity: 1;
+}
+
+#lightbox-image-wrapper {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+}
+
+#lightbox-img {
+    /* Image resizes to fit, but not exceed, the screen */
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    
+    /* Transition for when sidebar opens */
+    transition: margin-right 0.3s ease;
+}
+
+.lightbox-ui {
+    position: absolute;
+    top: 16px;
+    color: white;
+    font-size: 30px;
+    font-weight: bold;
+    cursor: pointer;
+    z-index: 102;
+    padding: 8px;
+    /* Add a subtle background for easier clicking */
+    background-color: rgba(30, 30, 30, 0.5);
+    border-radius: 50%;
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+#close-button {
+    left: 16px;
+    line-height: 30px; /* Center the 'x' */
+}
+
+#details-button {
+    right: 16px;
+}
+#details-button svg {
+    width: 28px;
+    height: 28px;
+}
+
+
+/* --- NEW: Metadata Sidebar Styles --- */
+
+#metadata-sidebar {
+    position: fixed;
+    top: 0;
+    right: -320px; /* Start off-screen */
+    width: 300px;
+    height: 100%;
+    background-color: #2e2e2e;
+    color: #f1f1f1;
+    z-index: 101;
+    padding: 10px;
+    overflow-y: auto;
+    box-shadow: -2px 0 10px rgba(0,0,0,0.5);
+    transition: right 0.3s ease;
+}
+
+#metadata-sidebar.show {
+    right: 0; /* Slide in */
+}
+
+/* This class is added when the sidebar is open */
+#lightbox-overlay.show-metadata #lightbox-img {
+    /* "Push" the image to the left */
+    margin-right: 320px;
+}
+
+#metadata-sidebar h3 {
+    text-align: center;
+    border-bottom: 1px solid #555;
+    padding-bottom: 10px;
+}
+#metadata-content {
+    padding: 10px;
+}
+#metadata-content p {
+    margin: 0 0 12px 0;
+    font-size: 14px;
+}
+#metadata-content strong {
+    display: block;
+    color: #aaa;
+    font-size: 12px;
+    margin-bottom: 2px;
+}
