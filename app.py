@@ -6,9 +6,9 @@ import json
 import time
 import threading
 
-# --- 1. NEW IMPORTS ---
+# --- 1. NEW IMPORTS (Corrected) ---
 import open_clip
-import aesthetics_predictor
+import aesthetic_predictor  # <-- This is the fix
 import torch
 
 from flask import Flask, render_template, jsonify
@@ -247,9 +247,11 @@ def run_eager_processing():
         device = get_auto_device()
         try:
             print(f"[Main Thread]: Loading aesthetic scorer model onto {device}...")
-            aesthetic_model = aesthetics_predictor.AestheticsPredictorV2(
+            # --- THIS IS THE FIX ---
+            aesthetic_model = aesthetic_predictor.AestheticsPredictorV2(
                 "sac_public_2022_06_29_vit_l_14_linear.pth"
             ).to(device)
+            # ---------------------
             print("[Main Thread]: Scorer loaded.")
             
             print(f"[Main Thread]: Loading CLIP model onto {device}...")
@@ -261,7 +263,9 @@ def run_eager_processing():
             
         except Exception as e:
             print(f"[Main Thread]: FATAL ERROR loading models: {e}")
-            print("Please run 'pip install aesthetics-predictor open-clip-torch'")
+            # --- THIS IS THE FIX ---
+            print("Please run 'pip install aesthetic-predictor open-clip-torch'")
+            # ---------------------
             sys.exit(1)
         
         # 2. Use ThreadPoolExecutor (correct for Mac + MPS)
