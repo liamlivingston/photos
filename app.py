@@ -5,7 +5,7 @@ import concurrent.futures
 import json
 import time
 import threading
-import psutil # 1. NEW IMPORT
+# import psutil # <-- REMOVED
 
 import pyiqa
 import torch
@@ -20,13 +20,11 @@ API_URL_BASE = 'static/cropped_images'
 RATIO_H = 7 / 5
 RATIO_V = 5 / 7
 RATING_CACHE_FILE = 'photo_ratings.json' 
-MAX_WORKERS = 4 
 
-# --- 2. NEW: Memory & Queue Config ---
-MAX_QUEUE_SIZE = MAX_WORKERS * 2
-# We set the memory limit in GB
-MIN_MEMORY_GB = 2.0
-MIN_MEM_BYTES = MIN_MEMORY_GB * 1024**3 # Convert GB to bytes
+# --- 1. MODIFIED: RAM Limit for Mac ---
+# Lowering to 2 workers to prevent OOM crash on 8GB RAM
+MAX_WORKERS = 2
+# MAX_QUEUE_SIZE = MAX_WORKERS * 2 # No longer needed
 
 # --- Flask Setup (Unchanged) ---
 app = Flask(
@@ -208,33 +206,7 @@ def get_photo_data_worker(task_tuple):
         "metadata": metadata
     }
 
-# --- 3. MODIFIED: Callback function (prints success) ---
-def process_result_callback(future, task, photo_data_map, failed_tasks, lock, semaphore, total_tasks):
-    """
-    A thread-safe callback to handle results as they come in.
-    This runs in the main thread.
-    """
-    filename = task[1]
-    try:
-        result = future.result()
-        with lock:
-            photo_data_map[result['id']] = result
-            # --- PRINT SUCCESS ---
-            # We use sys.stdout.write to print a clean log
-            count = len(photo_data_map) + len(failed_tasks)
-            percent = (count / total_tasks) * 100
-            sys.stdout.write(f"\rSUCCESS: {filename} (Rated: {result['rating']}) - {count}/{total_tasks} ({percent:.1f}%)\n")
-            sys.stdout.flush()
-            
-    except Exception as e:
-        print(f"\n[Parallel Error] Failed to process {filename}. Adding to retry queue. Error: {e}\n")
-        with lock:
-            failed_tasks.append(task)
-    finally:
-        # Release the semaphore to allow a new job to be queued
-        semaphore.release()
-
-# --- 4. MODIFIED: Eager Processing Function (with memory check) ---
+# --- 3. MODIFIED: Eager Processing Function (psutil removed) ---
 def run_eager_processing():
     """
     This is the main function that runs at startup.
@@ -269,64 +241,60 @@ def run_eager_processing():
         print(f"Getting photo data in PARALLEL using {executor_cls.__name__} (device: {device}, max_workers: {MAX_WORKERS})...")
         start_time = time.time()
         
-        # --- Bounded Queue Logic with Memory Check ---
-        
-        queue_semaphore = threading.Semaphore(MAX_QUEUE_SIZE)
-        results_lock = threading.Lock()
+        # --- Back to the 2-Pass system ---
         failed_tasks = []
-        total_tasks = len(tasks)
-        all_futures = []
 
         with executor_cls(max_workers=MAX_WORKERS, initializer=init_worker) as executor:
             
-            for task in tasks:
+            future_to_task = {
+                executor.submit(get_photo_data_worker, task): task 
+                for task in tasks
+            }
+            
+            count = 0
+            for future in concurrent.futures.as_completed(future_to_task):
+                task = future_to_task[future]
+                filename = task[1]
+                count += 1
                 
-                # --- 5. NEW: MEMORY CHECK ---
-                # First, check if we have enough memory to even *queue* a new job
-                while psutil.virtual_memory().available < MIN_MEM_BYTES:
-                    available_gb = psutil.virtual_memory().available / 1024**3
-                    sys.stdout.write(f"\r[Memory Throttling] Waiting... (Available: {available_gb:.1f}GB, Need: {MIN_MEMORY_GB}GB)\n")
+                try:
+                    result = future.result()
+                    photo_data_map[result['id']] = result
+                    
+                    # Print progress
+                    percent = (count / len(tasks)) * 100
+                    sys.stdout.write(f"\r  ... Pass 1: Rated {count} / {len(tasks)} ({percent:.1f}%) - {filename} -> {result['rating']}\n")
                     sys.stdout.flush()
-                    time.sleep(2) # Wait 2 seconds
-                
-                # Now, wait for a *slot* in our bounded queue
-                queue_semaphore.acquire() 
-                
-                # We have memory and a slot, submit the job
-                future = executor.submit(get_photo_data_worker, task)
-                
-                future.add_done_callback(
-                    lambda f, t=task: process_result_callback(
-                        f, t, photo_data_map, failed_tasks, results_lock, queue_semaphore, total_tasks
-                    )
-                )
-                all_futures.append(future)
 
-            # Wait for all futures to be completed
-            concurrent.futures.wait(all_futures)
-
+                except Exception as e:
+                    # Add to retry list
+                    print(f"\n[Parallel Error] Failed to process {filename}. Adding to retry queue. Error: {e}\n")
+                    failed_tasks.append(task)
+            
         end_time = time.time()
         print(f"\nFinished Pass 1 in {end_time - start_time:.2f} seconds.")
 
-        # --- Pass 2: Serial Retry (Unchanged) ---
+        # --- Pass 2: Serial Retry ---
         if failed_tasks:
-            print(f"\nRetrying {len(failed_tasks)} failed images in SERIAL...")
-            if not aesthetic_model: init_worker()
+            print(f"\nRetrying {len(failed_tasks)} failed images in SERIAL (this will be stable)...")
+            if not aesthetic_model: init_worker() # Ensure model is loaded
             start_time_serial = time.time()
+            
             for i, task in enumerate(failed_tasks):
                 filename = task[1]
                 try:
                     result = get_photo_data_worker(task)
                     photo_data_map[result['id']] = result
-                    sys.stdout.write(f"\r  ... Pass 2: Rerated {i + 1} / {len(failed_tasks)} ({filename}) - SUCCESS\n")
+                    sys.stdout.write(f"\r  ... Pass 2: Rerated {i + 1} / {len(failed_tasks)} ({filename}) -> {result['rating']}\n")
                     sys.stdout.flush()
                 except Exception as e:
                     print(f"\n[Serial Error] FAILED to process {filename} even in serial mode: {e}")
+            
             end_time_serial = time.time()
             print(f"\nFinished Pass 2 in {end_time_serial - start_time_serial:.2f} seconds.")
 
     else:
-        # --- This is the FAST LAUNCH path (no flags) ---
+        # --- FAST LAUNCH path ---
         print("Getting photo data in SERIAL (using cache)...")
         for task in tasks:
             photo_data_map[task[0]] = get_photo_data_worker(task)
