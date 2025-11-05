@@ -4,6 +4,7 @@ import sys
 import concurrent.futures
 import json
 import time
+import threading # 1. NEW IMPORT
 
 import pyiqa
 import torch
@@ -20,47 +21,42 @@ RATIO_V = 5 / 7
 RATING_CACHE_FILE = 'photo_ratings.json' 
 MAX_WORKERS = 4 
 
-# --- Flask Setup ---
+# --- 2. NEW: Bounded Queue Size ---
+# This limits how many jobs we queue up in memory
+# to prevent OOM crashes from the queue itself.
+MAX_QUEUE_SIZE = MAX_WORKERS * 2
+
+# --- Flask Setup (Unchanged) ---
 app = Flask(
     __name__,
     static_folder='photos/static',
     template_folder='templates'
 )
-
-# --- Flag Definitions ---
 SHOULD_PROCESS_PHOTOS = "--reload" in sys.argv
 SHOULD_RELOAD_RATINGS = "--reload-ratings" in sys.argv
 SHOULD_FETCH_NEW_RATINGS = SHOULD_PROCESS_PHOTOS or SHOULD_RELOAD_RATINGS
 
-# --- 1. MODIFIED: Global State ---
-# These are now 'None' and will only be loaded if flags are passed.
+# --- Global State (Unchanged) ---
 device = None
 aesthetic_model = None 
-# This will hold all photo data in memory for a fast API
 ALL_PHOTO_DATA = []
 
-# --- 2. NEW: Device detection moved ---
+# --- Device Detection (Unchanged) ---
 def get_auto_device():
-    if torch.cuda.is_available():
-        print("Found CUDA/ROCm compatible GPU.")
-        return torch.device('cuda')
-    elif torch.backends.mps.is_available():
+    if torch.backends.mps.is_available():
         print("Found Apple Metal (MPS) GPU.")
         return torch.device('mps')
+    elif torch.cuda.is_available():
+        print("Found CUDA/ROCm compatible GPU.")
+        return torch.device('cuda')
     else:
         print("No GPU found. Using CPU.")
         return torch.device('cpu')
 
-# --- 3. NEW: Worker Initializer ---
+# --- Worker Initializer (Unchanged) ---
 def init_worker():
-    """
-    Called by each new worker process. Loads one copy of the model.
-    """
     global aesthetic_model, device
-    
-    # We must re-get the device in the new process
     device = get_auto_device() 
-    
     try:
         print(f"[Worker {os.getpid()}]: Loading model onto {device}...")
         aesthetic_model = pyiqa.create_metric('paq2piq', device=device)
@@ -152,7 +148,7 @@ def process_images():
     return processed_files
 
 def get_local_rating(cropped_image_path):
-    # 'aesthetic_model' is the global variable *within this worker*
+    # This 'aesthetic_model' is the global variable *within this worker*
     if not aesthetic_model:
         print(f"[Worker {os.getpid()}]: Model is not loaded, returning random rating.")
         return random.randint(3, 7)
@@ -195,8 +191,6 @@ def get_photo_data_worker(task_tuple):
         rating = ratings_cache[filename]
         new_rating = False
     else:
-        # This check is now redundant since we only call this
-        # if SHOULD_FETCH_NEW_RATINGS is true, but it's safe.
         if SHOULD_FETCH_NEW_RATINGS:
             rating = get_local_rating(target_path)
             new_rating = True
@@ -213,7 +207,26 @@ def get_photo_data_worker(task_tuple):
         "metadata": metadata
     }
 
-# --- 4. NEW: Eager Processing Function ---
+# --- 3. NEW: Helper function to process results ---
+def process_result_callback(future, task, photo_data_map, failed_tasks, lock, semaphore):
+    """
+    A thread-safe callback to handle results as they come in.
+    This runs in the main thread.
+    """
+    filename = task[1]
+    try:
+        result = future.result()
+        with lock:
+            photo_data_map[result['id']] = result
+    except Exception as e:
+        print(f"\n[Parallel Error] Failed to process {filename}. Adding to retry queue. Error: {e}")
+        with lock:
+            failed_tasks.append(task)
+    finally:
+        # 4. Release the semaphore to allow a new job to be queued
+        semaphore.release()
+
+# --- 5. MODIFIED: Eager Processing Function ---
 def run_eager_processing():
     """
     This is the main function that runs at startup.
@@ -221,12 +234,10 @@ def run_eager_processing():
     """
     global ALL_PHOTO_DATA, device
     
-    # This runs first, finding/creating cropped images
     processed_files = process_images() 
     
-    # Load the cache
     ratings_cache = {}
-    if not SHOULD_RELOAD_RATINGS: # Only load cache if not reloading
+    if not SHOULD_RELOAD_RATINGS:
         if os.path.exists(RATING_CACHE_FILE):
             try:
                 with open(RATING_CACHE_FILE, 'r') as f:
@@ -243,10 +254,8 @@ def run_eager_processing():
     if SHOULD_FETCH_NEW_RATINGS:
         # --- This block now only runs if a flag is passed ---
         
-        # 1. Set the global device
         device = get_auto_device()
         
-        # 2. Choose the correct executor
         executor_cls = concurrent.futures.ThreadPoolExecutor
         if device.type == 'cpu':
             executor_cls = concurrent.futures.ProcessPoolExecutor
@@ -254,38 +263,55 @@ def run_eager_processing():
         print(f"Getting photo data in PARALLEL using {executor_cls.__name__} (device: {device}, max_workers: {MAX_WORKERS})...")
         start_time = time.time()
         
-        # 3. Run the 2-pass parallel process
+        # --- 6. NEW: Bounded Queue Logic ---
+        
+        # Use a Semaphore to limit the number of outstanding jobs
+        queue_semaphore = threading.Semaphore(MAX_QUEUE_SIZE)
+        results_lock = threading.Lock()
         failed_tasks = []
+        count = 0
+        total_tasks = len(tasks)
+
         with executor_cls(max_workers=MAX_WORKERS, initializer=init_worker) as executor:
-            future_to_task = { executor.submit(get_photo_data_worker, task): task for task in tasks }
             
-            count = 0
-            for future in concurrent.futures.as_completed(future_to_task):
-                task = future_to_task[future]
-                filename = task[1]
-                count += 1
-                try:
-                    result = future.result()
-                    photo_data_map[result['id']] = result
-                    if count % 10 == 0 or count == len(tasks):
-                        percent = (count / len(tasks)) * 100
-                        sys.stdout.write(f"\r  ... Pass 1: Rated {count} / {len(tasks)} ({percent:.1f}%) images.")
-                        sys.stdout.flush()
-                except Exception as e:
-                    print(f"\n[Parallel Error] Failed to process {filename}. Adding to retry queue. Error: {e}")
-                    failed_tasks.append(task)
-            
+            # This is a list of all *pending* jobs
+            all_futures = []
+
+            for task in tasks:
+                # 1. Wait if the queue is full (this throttles memory)
+                queue_semaphore.acquire() 
+                
+                # 2. Submit the job
+                future = executor.submit(get_photo_data_worker, task)
+                
+                # 3. Add a callback to run *when the job is done*
+                # This callback will release the semaphore
+                future.add_done_callback(
+                    # We use a lambda to pass *our* args, not just the future
+                    lambda f, t=task: process_result_callback(
+                        f, t, photo_data_map, failed_tasks, results_lock, queue_semaphore
+                    )
+                )
+                all_futures.append(future)
+
+            # Wait for all jobs to complete (all futures to be "done")
+            # We can print progress here while we wait
+            while count < total_tasks:
+                done_count = sum(1 for f in all_futures if f.done())
+                if done_count > count:
+                    count = done_count
+                    percent = (count / total_tasks) * 100
+                    sys.stdout.write(f"\r  ... Pass 1: Rated {count} / {total_tasks} ({percent:.1f}%) images.")
+                    sys.stdout.flush()
+                time.sleep(0.1) # Sleep to avoid pegging the CPU
+
         end_time = time.time()
         print(f"\nFinished Pass 1 in {end_time - start_time:.2f} seconds.")
 
-        # --- Pass 2: Serial Retry ---
+        # --- Pass 2: Serial Retry (Unchanged) ---
         if failed_tasks:
             print(f"\nRetrying {len(failed_tasks)} failed images in SERIAL...")
-            # We must initialize the model in *this* main process
-            # if it hasn't been (e.g., if all parallel workers failed)
-            if not aesthetic_model:
-                init_worker()
-                
+            if not aesthetic_model: init_worker() # Ensure model is loaded
             start_time_serial = time.time()
             for i, task in enumerate(failed_tasks):
                 filename = task[1]
@@ -303,15 +329,11 @@ def run_eager_processing():
         # --- This is the FAST LAUNCH path (no flags) ---
         print("Getting photo data in SERIAL (using cache)...")
         for task in tasks:
-            # This is fast, it just reads the cache
             photo_data_map[task[0]] = get_photo_data_worker(task)
-
-    # --- 4. Final Processing ---
     
-    # Sort and store in the global variable
+    # --- Final Processing (Unchanged) ---
     ALL_PHOTO_DATA = [ photo_data_map[key] for key in sorted(photo_data_map.keys()) ]
     
-    # --- Save Cache ---
     cache_updated = False
     for data in ALL_PHOTO_DATA:
         if data.get("new_rating_acquired", False):
@@ -331,12 +353,11 @@ def run_eager_processing():
     print(f"\n--- {len(ALL_PHOTO_DATA)} photos loaded. Starting web server. ---")
 
 
-# --- Main Flask Routes ---
+# --- Main Flask Routes (Unchanged) ---
 @app.route('/')
 def index():
     return render_template('index.html')
 
-# --- 5. MODIFIED: API is now fast ---
 @app.route('/api/photos')
 def get_photos():
     """
@@ -348,11 +369,12 @@ def get_photos():
 
 if __name__ == '__main__':
     # Set 'spawn' method for Linux/CUDA
-    if sys.platform != 'darwin':
+    if sys.platform != 'darwin': # 'darwin' is the name for macOS
         import multiprocessing
-        multiprocessing.set_start_method('spawn', force=True)
+        if multiprocessing.get_start_method(allow_none=True) != 'spawn':
+             multiprocessing.set_start_method('spawn', force=True)
     
-    # --- 6. MODIFIED: Run processing *before* the server ---
+    # Run processing *before* the server
     run_eager_processing()
     
     app.run(debug=True)
