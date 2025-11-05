@@ -6,9 +6,9 @@ import json
 import time
 import threading
 
-# --- 1. NEW IMPORTS (Corrected) ---
+# --- 1. NEW IMPORTS ---
 import open_clip
-import aesthetic_predictor  # <-- This is the fix
+import aesthetic_predictor_v2_5
 import torch
 
 from flask import Flask, render_template, jsonify
@@ -137,7 +137,7 @@ def process_images():
 
     return processed_files
 
-# --- 3. MODIFIED: get_local_rating (using CLIP) ---
+# --- 3. MODIFIED: get_local_rating (using new CLIP model) ---
 def get_local_rating(cropped_image_path):
     """
     Runs the CLIP + Scorer model on an image.
@@ -216,7 +216,7 @@ def get_photo_data_worker(task_tuple):
         "metadata": metadata
     }
 
-# --- 4. MODIFIED: Eager Processing Function (Loads CLIP) ---
+# --- 4. MODIFIED: Eager Processing Function (Loads CLIP models) ---
 def run_eager_processing():
     """
     This is the main function that runs at startup.
@@ -247,11 +247,10 @@ def run_eager_processing():
         device = get_auto_device()
         try:
             print(f"[Main Thread]: Loading aesthetic scorer model onto {device}...")
-            # --- THIS IS THE FIX ---
-            aesthetic_model = aesthetic_predictor.AestheticsPredictorV2(
+            # --- This is the new model from the library ---
+            aesthetic_model = aesthetic_predictor_v2_5.AestheticsPredictor.from_pretrained(
                 "sac_public_2022_06_29_vit_l_14_linear.pth"
             ).to(device)
-            # ---------------------
             print("[Main Thread]: Scorer loaded.")
             
             print(f"[Main Thread]: Loading CLIP model onto {device}...")
@@ -263,9 +262,7 @@ def run_eager_processing():
             
         except Exception as e:
             print(f"[Main Thread]: FATAL ERROR loading models: {e}")
-            # --- THIS IS THE FIX ---
-            print("Please run 'pip install aesthetic-predictor open-clip-torch'")
-            # ---------------------
+            print("Please run 'pip install aesthetic-predictor-v2-5 open-clip-torch'")
             sys.exit(1)
         
         # 2. Use ThreadPoolExecutor (correct for Mac + MPS)
