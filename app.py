@@ -8,21 +8,23 @@ import threading
 
 import pyiqa
 import torch
-# import torch.nn.functional as F  <-- No longer needed
 
 from flask import Flask, render_template, jsonify
 from PIL import Image, ImageOps, ExifTags
 
-# --- Configuration (Unchanged) ---
+# --- Configuration ---
+# !!! IMPORTANT: Make sure this path is correct for your Mac !!!
 SOURCE_FOLDER = '/home/liam/Pictures/Backup/Panasonic G7/107_PANA'
 TARGET_FOLDER = 'photos/static/cropped_images'
 API_URL_BASE = 'static/cropped_images' 
 RATIO_H = 7 / 5
 RATIO_V = 5 / 7
 RATING_CACHE_FILE = 'photo_ratings.json' 
+
+# Set to 2 to prevent OOM crash on 8GB RAM
 MAX_WORKERS = 2 
 
-# --- Flask Setup (Unchanged) ---
+# --- Flask Setup ---
 app = Flask(
     __name__,
     static_folder='photos/static',
@@ -32,34 +34,22 @@ SHOULD_PROCESS_PHOTOS = "--reload" in sys.argv
 SHOULD_RELOAD_RATINGS = "--reload-ratings" in sys.argv
 SHOULD_FETCH_NEW_RATINGS = SHOULD_PROCESS_PHOTOS or SHOULD_RELOAD_RATINGS
 
-# --- Global State (Unchanged) ---
+# --- Global State ---
 device = None
-aesthetic_model = None 
+aesthetic_model = None # Will be loaded in the main thread
 ALL_PHOTO_DATA = []
 
-# --- Device Detection (Unchanged) ---
+# --- 1. MODIFIED: Mac-Only Device Detection ---
 def get_auto_device():
+    """
+    Finds the Mac GPU (MPS) or falls back to CPU.
+    """
     if torch.backends.mps.is_available():
         print("Found Apple Metal (MPS) GPU.")
         return torch.device('mps')
-    elif torch.cuda.is_available():
-        print("Found CUDA/ROCm compatible GPU.")
-        return torch.device('cuda')
     else:
         print("No GPU found. Using CPU.")
         return torch.device('cpu')
-
-# --- Worker Initializer (Unchanged, now only used by ProcessPool) ---
-def init_worker():
-    global aesthetic_model, device
-    device = get_auto_device() 
-    try:
-        print(f"[Worker {os.getpid()}]: Loading CLIPIQA model onto {device}...")
-        aesthetic_model = pyiqa.create_metric('clipiqa-rn50-ava', device=device)
-        print(f"[Worker {os.getpid()}]: CLIPIQA model loaded successfully.")
-    except Exception as e:
-        print(f"[Worker {os.getpid()}]: ERROR loading CLIPIQA model: {e}")
-        aesthetic_model = None
 
 # --- Helper Functions (Unchanged) ---
 def center_crop(img, crop_width, crop_height):
@@ -143,13 +133,16 @@ def process_images():
 
     return processed_files
 
-# --- 3. MODIFIED: get_local_rating (checks global model) ---
+# --- 3. MODIFIED: get_local_rating (reads global model) ---
 def get_local_rating(cropped_image_path):
-    # This 'aesthetic_model' is the global one.
-    # In ThreadPool mode, it's the one from the main thread.
-    # In ProcessPool mode, it's the one set by init_worker.
+    """
+    Runs the local paq2piq model on an image.
+    This function reads the 'aesthetic_model' global variable.
+    """
+    # This 'aesthetic_model' is the global one set in the main thread
     if not aesthetic_model:
-        print(f"[Worker {os.getpid()}]: Model is not loaded, returning random rating.")
+        # This will now only happen if the model fails to load at startup
+        print("FATAL: Model is not loaded. Returning random rating.")
         return random.randint(3, 7)
     try:
         score_0_to_100 = aesthetic_model(cropped_image_path).item()
@@ -207,13 +200,13 @@ def get_photo_data_worker(task_tuple):
         "metadata": metadata
     }
 
-# --- 4. MODIFIED: Eager Processing Function (Correct Model Loading) ---
+# --- 4. MODIFIED: Eager Processing Function ---
 def run_eager_processing():
     """
     This is the main function that runs at startup.
     It prepares all photo data and populates the global ALL_PHOTO_DATA.
     """
-    global ALL_PHOTO_DATA, device, aesthetic_model # We now set the model here
+    global ALL_PHOTO_DATA, device, aesthetic_model # We set the global model here
     
     processed_files = process_images() 
     
@@ -234,37 +227,30 @@ def run_eager_processing():
     
     if SHOULD_FETCH_NEW_RATINGS:
         
+        # --- THIS IS THE FIX ---
+        # 1. Load the device and model ONCE in the main thread
         device = get_auto_device()
-        
-        # --- Executor selection ---
+        try:
+            print(f"[Main Thread]: Loading CLIPIQA model onto {device}...")
+            # We set the global 'aesthetic_model' variable
+            aesthetic_model = pyiqa.create_metric('clipiqa-rn50-ava', device=device)
+            print(f"[Main Thread]: CLIPIQA model loaded successfully.")
+        except Exception as e:
+            print(f"[Main Thread]: FATAL ERROR loading model: {e}")
+            aesthetic_model = None
+        # ---------------------
+
+        # 2. Use ThreadPoolExecutor (correct for Mac + MPS)
         executor_cls = concurrent.futures.ThreadPoolExecutor
-        executor_init_fn = None # No initializer for ThreadPool
-        
-        if device.type == 'cpu':
-            executor_cls = concurrent.futures.ProcessPoolExecutor
-            executor_init_fn = init_worker # Use initializer for ProcessPool
 
         print(f"Getting photo data in PARALLEL using {executor_cls.__name__} (device: {device}, max_workers: {MAX_WORKERS})...")
-        
-        # --- THIS IS THE FIX ---
-        # If we are using ThreadPool (e.g., on Mac), we must load the 
-        # model *once* in the main thread.
-        if executor_cls == concurrent.futures.ThreadPoolExecutor:
-            try:
-                print(f"[Main Thread]: Loading CLIPIQA model onto {device}...")
-                aesthetic_model = pyiqa.create_metric('clipiqa-rn50-ava', device=device)
-                print(f"[Main Thread]: CLIPIQA model loaded successfully.")
-            except Exception as e:
-                print(f"[Main Thread]: ERROR loading model: {e}")
-                aesthetic_model = None
-        # ---------------------
-        
         start_time = time.time()
         
         # --- 2-Pass system ---
         failed_tasks = []
 
-        with executor_cls(max_workers=MAX_WORKERS, initializer=executor_init_fn) as executor:
+        # We no longer need an initializer
+        with executor_cls(max_workers=MAX_WORKERS) as executor:
             
             future_to_task = {
                 executor.submit(get_photo_data_worker, task): task 
@@ -295,15 +281,7 @@ def run_eager_processing():
         # --- Pass 2: Serial Retry ---
         if failed_tasks:
             print(f"\nRetrying {len(failed_tasks)} failed images in SERIAL (this will be stable)...")
-            # Ensure model is loaded in main thread if it hasn't been
-            if not aesthetic_model:
-                try:
-                    print(f"[Main Thread]: Loading model for serial retry...")
-                    aesthetic_model = pyiqa.create_metric('clipiqa-rn50-ava', device=device)
-                    print(f"[Main Thread]: Model loaded successfully.")
-                except Exception as e:
-                    print(f"[Main Thread]: ERROR loading model: {e}")
-            
+            # Model is already loaded in the main thread, no init needed
             start_time_serial = time.time()
             
             for i, task in enumerate(failed_tasks):
@@ -323,7 +301,6 @@ def run_eager_processing():
         # --- FAST LAUNCH path ---
         print("Getting photo data in SERIAL (using cache)...")
         for task in tasks:
-            # This is fast, it just reads the cache
             photo_data_map[task[0]] = get_photo_data_worker(task)
     
     # --- Final Processing (Unchanged) ---
@@ -360,11 +337,6 @@ def get_photos():
 
 
 if __name__ == '__main__':
-    if sys.platform != 'darwin':
-        import multiprocessing
-        if multiprocessing.get_start_method(allow_none=True) != 'spawn':
-             multiprocessing.set_start_method('spawn', force=True)
-    
+    # Removed all Linux 'spawn' logic
     run_eager_processing()
-    
     app.run(debug=True)
