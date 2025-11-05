@@ -39,7 +39,7 @@ device = None
 aesthetic_model = None # Will be loaded in the main thread
 ALL_PHOTO_DATA = []
 
-# --- 1. MODIFIED: Mac-Only Device Detection ---
+# --- 1. Mac-Only Device Detection ---
 def get_auto_device():
     """
     Finds the Mac GPU (MPS) or falls back to CPU.
@@ -133,20 +133,22 @@ def process_images():
 
     return processed_files
 
-# --- 3. MODIFIED: get_local_rating (reads global model) ---
+# --- 2. MODIFIED: get_local_rating (using paq2piq) ---
 def get_local_rating(cropped_image_path):
     """
     Runs the local paq2piq model on an image.
     This function reads the 'aesthetic_model' global variable.
     """
-    # This 'aesthetic_model' is the global one set in the main thread
     if not aesthetic_model:
-        # This will now only happen if the model fails to load at startup
         print("FATAL: Model is not loaded. Returning random rating.")
         return random.randint(3, 7)
     try:
+        # 1. This model returns a simple 0-100 score
         score_0_to_100 = aesthetic_model(cropped_image_path).item()
+        
+        # 2. We scale it to 1-10
         rating = (score_0_to_100 / 100) * 9 + 1
+        
         rating = round(rating, 1) 
         return rating
     except Exception as e:
@@ -200,7 +202,7 @@ def get_photo_data_worker(task_tuple):
         "metadata": metadata
     }
 
-# --- 4. MODIFIED: Eager Processing Function ---
+# --- 3. MODIFIED: Eager Processing Function ---
 def run_eager_processing():
     """
     This is the main function that runs at startup.
@@ -227,29 +229,27 @@ def run_eager_processing():
     
     if SHOULD_FETCH_NEW_RATINGS:
         
-        # --- THIS IS THE FIX ---
         # 1. Load the device and model ONCE in the main thread
         device = get_auto_device()
         try:
-            print(f"[Main Thread]: Loading CLIPIQA model onto {device}...")
+            print(f"[Main Thread]: Loading paq2piq model onto {device}...")
             # We set the global 'aesthetic_model' variable
-            aesthetic_model = pyiqa.create_metric('clipiqa-rn50-ava', device=device)
-            print(f"[Main Thread]: CLIPIQA model loaded successfully.")
+            aesthetic_model = pyiqa.create_metric('paq2piq', device=device)
+            print(f"[Main Thread]: paq2piq model loaded successfully.")
         except Exception as e:
             print(f"[Main Thread]: FATAL ERROR loading model: {e}")
-            aesthetic_model = None
-        # ---------------------
-
+            print("The app cannot continue. Please check the error.")
+            sys.exit(1) # Exit if the model fails to load
+        
         # 2. Use ThreadPoolExecutor (correct for Mac + MPS)
         executor_cls = concurrent.futures.ThreadPoolExecutor
 
         print(f"Getting photo data in PARALLEL using {executor_cls.__name__} (device: {device}, max_workers: {MAX_WORKERS})...")
         start_time = time.time()
         
-        # --- 2-Pass system ---
-        failed_tasks = []
-
-        # We no longer need an initializer
+        # We are going back to the simpler loop for now.
+        # The MAX_WORKERS=2 limit should prevent OOM crashes.
+        
         with executor_cls(max_workers=MAX_WORKERS) as executor:
             
             future_to_task = {
@@ -268,34 +268,16 @@ def run_eager_processing():
                     photo_data_map[result['id']] = result
                     
                     percent = (count / len(tasks)) * 100
-                    sys.stdout.write(f"\r  ... Pass 1: Rated {count} / {len(tasks)} ({percent:.1f}%) - {filename} -> {result['rating']}\n")
+                    sys.stdout.write(f"\r  ... Rated {count} / {len(tasks)} ({percent:.1f}%) - {filename} -> {result['rating']}\n")
                     sys.stdout.flush()
 
                 except Exception as e:
-                    print(f"\n[Parallel Error] Failed to process {filename}. Adding to retry queue. Error: {e}\n")
-                    failed_tasks.append(task)
+                    # If this still happens, we just report it.
+                    # The 2-pass system was too complex.
+                    print(f"\n[Parallel Error] Failed to process {filename}. Error: {e}\n")
             
         end_time = time.time()
-        print(f"\nFinished Pass 1 in {end_time - start_time:.2f} seconds.")
-
-        # --- Pass 2: Serial Retry ---
-        if failed_tasks:
-            print(f"\nRetrying {len(failed_tasks)} failed images in SERIAL (this will be stable)...")
-            # Model is already loaded in the main thread, no init needed
-            start_time_serial = time.time()
-            
-            for i, task in enumerate(failed_tasks):
-                filename = task[1]
-                try:
-                    result = get_photo_data_worker(task)
-                    photo_data_map[result['id']] = result
-                    sys.stdout.write(f"\r  ... Pass 2: Rerated {i + 1} / {len(failed_tasks)} ({filename}) -> {result['rating']}\n")
-                    sys.stdout.flush()
-                except Exception as e:
-                    print(f"\n[Serial Error] FAILED to process {filename} even in serial mode: {e}")
-            
-            end_time_serial = time.time()
-            print(f"\nFinished Pass 2 in {end_time_serial - start_time_serial:.2f} seconds.")
+        print(f"\nFinished rating in {end_time - start_time:.2f} seconds.")
 
     else:
         # --- FAST LAUNCH path ---
