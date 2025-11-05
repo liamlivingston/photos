@@ -2,5 +2,5 @@ Flask
 Pillow
 torch
 torchvision
-aesthetics-predictor
+aesthetic-predictor
 open-clip-torch
