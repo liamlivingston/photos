@@ -8,7 +8,7 @@ import threading
 
 import pyiqa
 import torch
-import torch.nn.functional as F  # 1. NEW IMPORT
+# import torch.nn.functional as F  <-- No longer needed
 
 from flask import Flask, render_template, jsonify
 from PIL import Image, ImageOps, ExifTags
@@ -49,26 +49,23 @@ def get_auto_device():
         print("No GPU found. Using CPU.")
         return torch.device('cpu')
 
-# --- 2. MODIFIED: Worker Initializer (Switched to NIMA) ---
+# --- 2. MODIFIED: Worker Initializer (Switched to CLIPIQA) ---
 def init_worker():
     """
-    Called by each new worker process. Loads one copy of the NIMA model.
+    Called by each new worker process. Loads one copy of the CLIPIQA model.
     """
-    global aesthetic_model, device, score_weights
+    global aesthetic_model, device
     
     device = get_auto_device() 
     
     try:
-        print(f"[Worker {os.getpid()}]: Loading NIMA model onto {device}...")
-        # *** We are now using the NIMA model ***
-        aesthetic_model = pyiqa.create_metric('nima-vgg16-ava', device=device)
+        print(f"[Worker {os.getpid()}]: Loading CLIPIQA model onto {device}...")
+        # *** We are now using the CLIPIQA model ***
+        aesthetic_model = pyiqa.create_metric('clipiqa-rn50-ava', device=device)
         
-        # Pre-calculate the 1-10 weights for the score
-        score_weights = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=torch.float32).to(device)
-        
-        print(f"[Worker {os.getpid()}]: NIMA model loaded successfully.")
+        print(f"[Worker {os.getpid()}]: CLIPIQA model loaded successfully.")
     except Exception as e:
-        print(f"[Worker {os.getpid()}]: ERROR loading NIMA model: {e}")
+        print(f"[Worker {os.getpid()}]: ERROR loading CLIPIQA model: {e}")
         aesthetic_model = None
 
 # --- Helper Functions (Unchanged) ---
@@ -153,24 +150,20 @@ def process_images():
 
     return processed_files
 
-# --- 3. MODIFIED: Local Rating Function (with NIMA math) ---
+# --- 3. MODIFIED: Local Rating Function (simple 0-100 scaling) ---
 def get_local_rating(cropped_image_path):
     if not aesthetic_model:
         print(f"[Worker {os.getpid()}]: Model is not loaded, returning random rating.")
         return random.randint(3, 7)
     try:
-        # 1. Get the raw output (logits) from the model
-        score_distribution = aesthetic_model(cropped_image_path).squeeze()
+        # 1. This model returns a simple 0-100 score
+        score_0_to_100 = aesthetic_model(cropped_image_path).item()
         
-        # 2. Apply softmax to convert logits to probabilities
-        # This is the step that was missing before.
-        probabilities = F.softmax(score_distribution, dim=0)
+        # 2. We scale it to 1-10
+        # (A 0/100 score becomes 1, a 100/100 score becomes 10)
+        rating = (score_0_to_100 / 100) * 9 + 1
         
-        # 3. Calculate the weighted mean
-        mean_score = (probabilities * score_weights).sum()
-        
-        # .item() pulls the number out of the PyTorch tensor
-        rating = round(mean_score.item(), 1) 
+        rating = round(rating, 1) 
         return rating
     except Exception as e:
         raise e
