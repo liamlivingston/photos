@@ -2,29 +2,49 @@ import os
 import random
 import sys
 import concurrent.futures
+import json
+
+import pyiqa
+import torch
+# import torch.nn.functional as F  <-- No longer needed
+
 from flask import Flask, render_template, jsonify
 from PIL import Image, ImageOps, ExifTags
 
-# --- Configuration ---
+# --- Configuration (Unchanged) ---
 SOURCE_FOLDER = '/home/liam/Pictures/Backup/Panasonic G7/107_PANA'
-# This is the PHYSICAL file system path
 TARGET_FOLDER = 'photos/static/cropped_images'
-# *** 1. ADD THIS: This is the WEB URL path ***
 API_URL_BASE = 'static/cropped_images' 
-
 RATIO_H = 7 / 5
 RATIO_V = 5 / 7
+RATING_CACHE_FILE = 'photo_ratings.json' 
 
-# This setup is correct
+# --- Flask Setup (Unchanged) ---
 app = Flask(
     __name__,
     static_folder='photos/static',
     template_folder='templates'
 )
-
 SHOULD_RUN_PROCESSING = "--reload" in sys.argv
 
-# --- Helper Function (Unchanged) ---
+# --- Local Model Setup (Unchanged) ---
+try:
+    # This will now find 'cuda' if you ran the install step
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # We use the paq2piq model
+    aesthetic_model = pyiqa.create_metric('paq2piq', device=device)
+    
+    print("Local aesthetic model (pyiqa paq2piq) loaded successfully.")
+
+except Exception as e:
+    print(f"Error loading local model: {e}")
+    print("Please run 'pip install pyiqa torch torchvision --index-url https://download.pytorch.org/whl/rocm6.1'")
+    aesthetic_model = None
+
+# --- All helper functions (center_crop, process_single_image, process_images) are unchanged ---
+
 def center_crop(img, crop_width, crop_height):
     img_width, img_height = img.size
     left = (img_width - crop_width) / 2
@@ -33,7 +53,6 @@ def center_crop(img, crop_width, crop_height):
     bottom = (img_height + crop_height) / 2
     return img.crop((left, top, right, bottom))
 
-# --- Worker Function for Image Processing (Unchanged) ---
 def process_single_image(source_tuple):
     source_path, mtime = source_tuple
     filename = os.path.basename(source_path)
@@ -42,7 +61,7 @@ def process_single_image(source_tuple):
         return filename
     try:
         with Image.open(source_path) as img:
-            img = ImageOps.exif_transpose(img)
+            img = ImageOps.ex_transpose(img)
             width, height = img.size
             if width > height: # Horizontal
                 target_ratio = RATIO_H
@@ -61,7 +80,6 @@ def process_single_image(source_tuple):
         print(f"Error processing {filename}: {e}")
         return None
 
-# --- Updated Image Processing Manager Function (Unchanged) ---
 def process_images():
     if not os.path.exists(TARGET_FOLDER):
         os.makedirs(TARGET_FOLDER)
@@ -78,6 +96,7 @@ def process_images():
     processed_files = []
     if SHOULD_RUN_PROCESSING:
         print(f"Found {len(source_files)} images. Processing in PARALLEL...")
+        # ThreadPoolExecutor is correct for this I/O-bound task
         with concurrent.futures.ThreadPoolExecutor() as executor:
             results = list(executor.map(process_single_image, source_files))
         processed_files = [f for f in results if f is not None]
@@ -90,19 +109,36 @@ def process_images():
                 processed_files.append(filename)
     return processed_files
 
-# --- Worker Function for API Data ---
+# --- Local Rating Function (Unchanged) ---
+def get_local_rating(cropped_image_path):
+    """
+    Runs the local paq2piq model on an image and returns a 1-10 rating.
+    """
+    if not aesthetic_model:
+        return random.randint(3, 7) # Fallback
+
+    try:
+        score_0_to_100 = aesthetic_model(cropped_image_path).item()
+        rating = (score_0_to_100 / 100) * 9 + 1
+        rating = round(rating, 1) 
+        print(f"Local model rated {os.path.basename(cropped_image_path)}: {rating}/10")
+        return rating
+    except Exception as e:
+        print(f"Error during local rating for {os.path.basename(cropped_image_path)}: {e}")
+        return 5 # Fallback on error
+
+
+# --- Worker Function (Unchanged) ---
 def get_photo_data_worker(task_tuple):
-    i, filename = task_tuple
+    """
+    Worker task that gets orientation, metadata, AND local rating.
+    """
+    i, filename, ratings_cache = task_tuple 
+    
     target_path = os.path.join(TARGET_FOLDER, filename)
     source_path = os.path.join(SOURCE_FOLDER, filename)
     
-    metadata = {
-        "filename": filename,
-        "model": "Unknown",
-        "f_stop": "Unknown",
-        "shutter_speed": "Unknown",
-        "iso": "Unknown"
-    }
+    metadata = { "filename": filename, "model": "Unknown", "f_stop": "Unknown", "shutter_speed": "Unknown", "iso": "Unknown" }
     
     try:
         with Image.open(target_path) as img:
@@ -112,49 +148,99 @@ def get_photo_data_worker(task_tuple):
         with Image.open(source_path) as img:
             exif_data = img.getexif()
             if exif_data:
-                exif = {
-                    ExifTags.TAGS[k]: v
-                    for k, v in exif_data.items()
-                    if k in ExifTags.TAGS
-                }
+                exif = { ExifTags.TAGS[k]: v for k, v in exif_data.items() if k in ExifTags.TAGS }
                 metadata["model"] = exif.get("Model", "Unknown")
                 metadata["f_stop"] = f"f/{exif.get('FNumber', 'N/A')}"
                 ss = exif.get('ExposureTime', 0)
                 if ss > 0:
                     metadata["shutter_speed"] = f"1/{round(1/ss)}s" if ss < 1 else f"{ss}s"
                 metadata["iso"] = exif.get("ISOSpeedRatings", "N/A")
+
     except Exception as e:
         print(f"Error reading metadata for {filename}: {e}")
         orientation = 'horizontal'
+    
+    # --- RATING LOGIC (Unchanged) ---
+    if filename in ratings_cache:
+        rating = ratings_cache[filename]
+        new_rating = False
+    else:
+        if SHOULD_RUN_PROCESSING:
+            rating = get_local_rating(target_path)
+            new_rating = True
+        else:
+            rating = 5
+            new_rating = False
             
     return {
         "id": i + 1,
-        "rating": random.randint(1, 10),
+        "rating": rating,
+        "new_rating_acquired": new_rating,
         "orientation": orientation,
-        # *** 2. THIS IS THE FIX: Use API_URL_BASE ***
-        "url": f"/{API_URL_BASE}/{filename}", 
+        "url": f"/{API_URL_BASE}/{filename}",
         "metadata": metadata
     }
 
-# --- Main Flask Routes (Unchanged) ---
+# --- Main Flask Routes ---
 @app.route('/')
 def index():
     return render_template('index.html')
 
+# --- MODIFIED: get_photos (Switched BACK to ThreadPoolExecutor) ---
 @app.route('/api/photos')
 def get_photos():
-    processed_files = process_images()
-    tasks = list(enumerate(processed_files))
+    """
+    This API now loads and saves the photo_ratings.json cache
+    using the 'pyiqa' local model.
+    """
+    processed_files = process_images() 
+    
+    ratings_cache = {}
+    if os.path.exists(RATING_CACHE_FILE):
+        try:
+            with open(RATING_CACHE_FILE, 'r') as f:
+                ratings_cache = json.load(f)
+                print(f"Loaded {len(ratings_cache)} ratings from cache.")
+        except Exception as e:
+            print(f"Error loading rating cache: {e}")
+
+    tasks = [(i, filename, ratings_cache) for i, filename in enumerate(processed_files)]
     photo_data = []
+
+    # *** THIS IS THE FIX FOR GPU ***
+    # ThreadPoolExecutor is correct for GPU (and I/O) tasks
+    # because the GPU work releases the Python GIL,
+    # allowing true parallel execution.
+    executor_cls = concurrent.futures.ThreadPoolExecutor
+    
     if SHOULD_RUN_PROCESSING:
-        print("Getting photo data in PARALLEL...")
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        print(f"Getting photo data in PARALLEL using {executor_cls.__name__}...")
+        with executor_cls() as executor:
             photo_data = list(executor.map(get_photo_data_worker, tasks))
     else:
         print("Getting photo data in SERIAL...")
         for task in tasks:
             photo_data.append(get_photo_data_worker(task))
+
+    # --- SAVE CACHE (Unchanged) ---
+    cache_updated = False
+    for data in photo_data:
+        if data.get("new_rating_acquired", False):
+            filename = data["metadata"]["filename"]
+            ratings_cache[filename] = data["rating"]
+            cache_updated = True
+        data.pop("new_rating_acquired", None) 
+            
+    if cache_updated:
+        print("Saving new ratings to cache...")
+        try:
+            with open(RATING_CACHE_FILE, 'w') as f:
+                json.dump(ratings_cache, f, indent=2)
+        except Exception as e:
+            print(f"Error saving rating cache: {e}")
+
     return jsonify(photo_data)
+
 
 if __name__ == '__main__':
     app.run(debug=True)
