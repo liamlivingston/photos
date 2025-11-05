@@ -12,20 +12,13 @@ from flask import Flask, render_template, jsonify
 from PIL import Image, ImageOps, ExifTags
 
 # --- Configuration ---
-# !!! IMPORTANT: Update this path for your Mac !!!
-SOURCE_FOLDER = '/Users/liam/Pictures/my_panasonic_photos' # e.g.
+SOURCE_FOLDER = '/home/liam/Pictures/Backup/Panasonic G7/107_PANA'
 TARGET_FOLDER = 'photos/static/cropped_images'
 API_URL_BASE = 'static/cropped_images' 
 RATIO_H = 7 / 5
 RATIO_V = 5 / 7
 RATING_CACHE_FILE = 'photo_ratings.json' 
-
-# --- 1. MODIFIED: RAM Limit for Mac ---
-# This is the fix for the crash. We are limiting
-# the app to 4 parallel workers.
-# If it still crashes, try lowering this to 2.
-MAX_WORKERS = 4
-# --------------------------------------
+MAX_WORKERS = 4 
 
 # --- Flask Setup ---
 app = Flask(
@@ -33,34 +26,50 @@ app = Flask(
     static_folder='photos/static',
     template_folder='templates'
 )
+
+# --- Flag Definitions ---
 SHOULD_PROCESS_PHOTOS = "--reload" in sys.argv
 SHOULD_RELOAD_RATINGS = "--reload-ratings" in sys.argv
 SHOULD_FETCH_NEW_RATINGS = SHOULD_PROCESS_PHOTOS or SHOULD_RELOAD_RATINGS
 
+# --- 1. MODIFIED: Global State ---
+# These are now 'None' and will only be loaded if flags are passed.
+device = None
+aesthetic_model = None 
+# This will hold all photo data in memory for a fast API
+ALL_PHOTO_DATA = []
 
-# --- 2. MODIFIED: Mac-specific Device Detection ---
+# --- 2. NEW: Device detection moved ---
 def get_auto_device():
-    """
-    Automatically detects and returns the best device (MPS or CPU).
-    """
-    if torch.backends.mps.is_available():
+    if torch.cuda.is_available():
+        print("Found CUDA/ROCm compatible GPU.")
+        return torch.device('cuda')
+    elif torch.backends.mps.is_available():
         print("Found Apple Metal (MPS) GPU.")
         return torch.device('mps')
     else:
         print("No GPU found. Using CPU.")
         return torch.device('cpu')
 
-# --- Local Model Setup (Unchanged) ---
-try:
-    device = get_auto_device()
-    print(f"Using device: {device}")
-    aesthetic_model = pyiqa.create_metric('paq2piq', device=device)
-    print(f"Local aesthetic model (pyiqa paq2piq) loaded successfully on {device}.")
-except Exception as e:
-    print(f"Error loading local model: {e}")
-    aesthetic_model = None
+# --- 3. NEW: Worker Initializer ---
+def init_worker():
+    """
+    Called by each new worker process. Loads one copy of the model.
+    """
+    global aesthetic_model, device
+    
+    # We must re-get the device in the new process
+    device = get_auto_device() 
+    
+    try:
+        print(f"[Worker {os.getpid()}]: Loading model onto {device}...")
+        aesthetic_model = pyiqa.create_metric('paq2piq', device=device)
+        print(f"[Worker {os.getpid()}]: Model loaded successfully.")
+    except Exception as e:
+        print(f"[Worker {os.getpid()}]: ERROR loading model: {e}")
+        aesthetic_model = None
 
-# --- center_crop (Unchanged) ---
+# --- Helper Functions (Unchanged) ---
 def center_crop(img, crop_width, crop_height):
     img_width, img_height = img.size
     left = (img_width - crop_width) / 2
@@ -69,7 +78,6 @@ def center_crop(img, crop_width, crop_height):
     bottom = (img_height + crop_height) / 2
     return img.crop((left, top, right, bottom))
 
-# --- process_single_image (Unchanged) ---
 def process_single_image(source_tuple):
     source_path, mtime = source_tuple
     filename = os.path.basename(source_path)
@@ -97,7 +105,6 @@ def process_single_image(source_tuple):
         print(f"Error processing {filename}: {e}")
         return None
 
-# --- 3. MODIFIED: process_images (RAM limit) ---
 def process_images():
     if not os.path.exists(TARGET_FOLDER):
         os.makedirs(TARGET_FOLDER)
@@ -123,7 +130,6 @@ def process_images():
         source_files.sort(key=lambda x: x[1])
         print(f"Found {len(source_files)} images. Processing in PARALLEL...")
         
-        # Apply the MAX_WORKERS limit
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             results = list(executor.map(process_single_image, source_files))
         
@@ -145,9 +151,10 @@ def process_images():
 
     return processed_files
 
-# --- get_local_rating (Unchanged) ---
 def get_local_rating(cropped_image_path):
+    # 'aesthetic_model' is the global variable *within this worker*
     if not aesthetic_model:
+        print(f"[Worker {os.getpid()}]: Model is not loaded, returning random rating.")
         return random.randint(3, 7)
     try:
         score_0_to_100 = aesthetic_model(cropped_image_path).item()
@@ -157,7 +164,6 @@ def get_local_rating(cropped_image_path):
     except Exception as e:
         raise e
 
-# --- get_photo_data_worker (Unchanged) ---
 def get_photo_data_worker(task_tuple):
     i, filename, ratings_cache = task_tuple 
     target_path = os.path.join(TARGET_FOLDER, filename)
@@ -189,6 +195,8 @@ def get_photo_data_worker(task_tuple):
         rating = ratings_cache[filename]
         new_rating = False
     else:
+        # This check is now redundant since we only call this
+        # if SHOULD_FETCH_NEW_RATINGS is true, but it's safe.
         if SHOULD_FETCH_NEW_RATINGS:
             rating = get_local_rating(target_path)
             new_rating = True
@@ -205,22 +213,20 @@ def get_photo_data_worker(task_tuple):
         "metadata": metadata
     }
 
-# --- Main Flask Routes ---
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-# --- MODIFIED: get_photos (with 2-Pass Retry Logic) ---
-@app.route('/api/photos')
-def get_photos():
+# --- 4. NEW: Eager Processing Function ---
+def run_eager_processing():
     """
-    This API now loads and saves the photo_ratings.json cache
-    and uses a 2-pass system to ensure all images are rated.
+    This is the main function that runs at startup.
+    It prepares all photo data and populates the global ALL_PHOTO_DATA.
     """
+    global ALL_PHOTO_DATA, device
+    
+    # This runs first, finding/creating cropped images
     processed_files = process_images() 
     
+    # Load the cache
     ratings_cache = {}
-    if not SHOULD_RELOAD_RATINGS:
+    if not SHOULD_RELOAD_RATINGS: # Only load cache if not reloading
         if os.path.exists(RATING_CACHE_FILE):
             try:
                 with open(RATING_CACHE_FILE, 'r') as f:
@@ -232,87 +238,86 @@ def get_photos():
         print("Reloading ratings: Starting with an empty cache.")
 
     tasks = [(i, filename, ratings_cache) for i, filename in enumerate(processed_files)]
-    photo_data_map = {} 
-    
-    # --- 1. NEW: List to hold failed tasks for Pass 2 ---
-    failed_tasks = [] 
-
-    executor_cls = concurrent.futures.ThreadPoolExecutor
+    photo_data_map = {}
     
     if SHOULD_FETCH_NEW_RATINGS:
+        # --- This block now only runs if a flag is passed ---
+        
+        # 1. Set the global device
+        device = get_auto_device()
+        
+        # 2. Choose the correct executor
+        executor_cls = concurrent.futures.ThreadPoolExecutor
+        if device.type == 'cpu':
+            executor_cls = concurrent.futures.ProcessPoolExecutor
+
         print(f"Getting photo data in PARALLEL using {executor_cls.__name__} (device: {device}, max_workers: {MAX_WORKERS})...")
         start_time = time.time()
-
-        # --- PASS 1: PARALLEL ---
-        with executor_cls(max_workers=MAX_WORKERS) as executor:
-            
-            future_to_task = {
-                executor.submit(get_photo_data_worker, task): task 
-                for task in tasks
-            }
+        
+        # 3. Run the 2-pass parallel process
+        failed_tasks = []
+        with executor_cls(max_workers=MAX_WORKERS, initializer=init_worker) as executor:
+            future_to_task = { executor.submit(get_photo_data_worker, task): task for task in tasks }
             
             count = 0
             for future in concurrent.futures.as_completed(future_to_task):
                 task = future_to_task[future]
                 filename = task[1]
                 count += 1
-                
                 try:
                     result = future.result()
                     photo_data_map[result['id']] = result
-                    
                     if count % 10 == 0 or count == len(tasks):
                         percent = (count / len(tasks)) * 100
                         sys.stdout.write(f"\r  ... Pass 1: Rated {count} / {len(tasks)} ({percent:.1f}%) images.")
                         sys.stdout.flush()
-
                 except Exception as e:
-                    # --- 2. NEW: Add failed tasks to the retry list ---
                     print(f"\n[Parallel Error] Failed to process {filename}. Adding to retry queue. Error: {e}")
                     failed_tasks.append(task)
             
         end_time = time.time()
         print(f"\nFinished Pass 1 in {end_time - start_time:.2f} seconds.")
 
-        # --- 3. NEW: PASS 2: SERIAL RETRY ---
+        # --- Pass 2: Serial Retry ---
         if failed_tasks:
-            print(f"\nRetrying {len(failed_tasks)} failed images in SERIAL (this will be stable but slow)...")
+            print(f"\nRetrying {len(failed_tasks)} failed images in SERIAL...")
+            # We must initialize the model in *this* main process
+            # if it hasn't been (e.g., if all parallel workers failed)
+            if not aesthetic_model:
+                init_worker()
+                
             start_time_serial = time.time()
-            
             for i, task in enumerate(failed_tasks):
                 filename = task[1]
                 try:
-                    # Call the worker function directly, not in a pool
                     result = get_photo_data_worker(task)
                     photo_data_map[result['id']] = result
                     sys.stdout.write(f"\r  ... Pass 2: Rerated {i + 1} / {len(failed_tasks)} ({filename})")
                     sys.stdout.flush()
                 except Exception as e:
-                    # If it fails here, it's a permanent error
                     print(f"\n[Serial Error] FAILED to process {filename} even in serial mode: {e}")
-
             end_time_serial = time.time()
             print(f"\nFinished Pass 2 in {end_time_serial - start_time_serial:.2f} seconds.")
 
-        # 4. Re-sort the data into a list
-        photo_data = [
-            photo_data_map[key] 
-            for key in sorted(photo_data_map.keys())
-        ]
-            
     else:
+        # --- This is the FAST LAUNCH path (no flags) ---
         print("Getting photo data in SERIAL (using cache)...")
         for task in tasks:
-            photo_data.append(get_photo_data_worker(task))
+            # This is fast, it just reads the cache
+            photo_data_map[task[0]] = get_photo_data_worker(task)
 
-    # --- SAVE CACHE (Unchanged) ---
+    # --- 4. Final Processing ---
+    
+    # Sort and store in the global variable
+    ALL_PHOTO_DATA = [ photo_data_map[key] for key in sorted(photo_data_map.keys()) ]
+    
+    # --- Save Cache ---
     cache_updated = False
-    for data in photo_data:
+    for data in ALL_PHOTO_DATA:
         if data.get("new_rating_acquired", False):
             filename = data["metadata"]["filename"]
             ratings_cache[filename] = data["rating"]
             cache_updated = True
-        
         data.pop("new_rating_acquired", None) 
             
     if cache_updated:
@@ -323,9 +328,31 @@ def get_photos():
         except Exception as e:
             print(f"Error saving rating cache: {e}")
 
-    return jsonify(photo_data)
+    print(f"\n--- {len(ALL_PHOTO_DATA)} photos loaded. Starting web server. ---")
+
+
+# --- Main Flask Routes ---
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+# --- 5. MODIFIED: API is now fast ---
+@app.route('/api/photos')
+def get_photos():
+    """
+    This route is now very fast. It just serves the pre-computed data.
+    """
+    global ALL_PHOTO_DATA
+    return jsonify(ALL_PHOTO_DATA)
 
 
 if __name__ == '__main__':
-    # No 'spawn' method needed for Mac
+    # Set 'spawn' method for Linux/CUDA
+    if sys.platform != 'darwin':
+        import multiprocessing
+        multiprocessing.set_start_method('spawn', force=True)
+    
+    # --- 6. MODIFIED: Run processing *before* the server ---
+    run_eager_processing()
+    
     app.run(debug=True)
