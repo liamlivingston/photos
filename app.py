@@ -4,7 +4,8 @@ import sys
 import concurrent.futures
 import json
 import time
-import threading # 1. NEW IMPORT
+import threading
+import psutil # 1. NEW IMPORT
 
 import pyiqa
 import torch
@@ -21,10 +22,11 @@ RATIO_V = 5 / 7
 RATING_CACHE_FILE = 'photo_ratings.json' 
 MAX_WORKERS = 4 
 
-# --- 2. NEW: Bounded Queue Size ---
-# This limits how many jobs we queue up in memory
-# to prevent OOM crashes from the queue itself.
+# --- 2. NEW: Memory & Queue Config ---
 MAX_QUEUE_SIZE = MAX_WORKERS * 2
+# We set the memory limit in GB
+MIN_MEMORY_GB = 2.0
+MIN_MEM_BYTES = MIN_MEMORY_GB * 1024**3 # Convert GB to bytes
 
 # --- Flask Setup (Unchanged) ---
 app = Flask(
@@ -148,7 +150,6 @@ def process_images():
     return processed_files
 
 def get_local_rating(cropped_image_path):
-    # This 'aesthetic_model' is the global variable *within this worker*
     if not aesthetic_model:
         print(f"[Worker {os.getpid()}]: Model is not loaded, returning random rating.")
         return random.randint(3, 7)
@@ -207,8 +208,8 @@ def get_photo_data_worker(task_tuple):
         "metadata": metadata
     }
 
-# --- 3. NEW: Helper function to process results ---
-def process_result_callback(future, task, photo_data_map, failed_tasks, lock, semaphore):
+# --- 3. MODIFIED: Callback function (prints success) ---
+def process_result_callback(future, task, photo_data_map, failed_tasks, lock, semaphore, total_tasks):
     """
     A thread-safe callback to handle results as they come in.
     This runs in the main thread.
@@ -218,15 +219,22 @@ def process_result_callback(future, task, photo_data_map, failed_tasks, lock, se
         result = future.result()
         with lock:
             photo_data_map[result['id']] = result
+            # --- PRINT SUCCESS ---
+            # We use sys.stdout.write to print a clean log
+            count = len(photo_data_map) + len(failed_tasks)
+            percent = (count / total_tasks) * 100
+            sys.stdout.write(f"\rSUCCESS: {filename} (Rated: {result['rating']}) - {count}/{total_tasks} ({percent:.1f}%)\n")
+            sys.stdout.flush()
+            
     except Exception as e:
-        print(f"\n[Parallel Error] Failed to process {filename}. Adding to retry queue. Error: {e}")
+        print(f"\n[Parallel Error] Failed to process {filename}. Adding to retry queue. Error: {e}\n")
         with lock:
             failed_tasks.append(task)
     finally:
-        # 4. Release the semaphore to allow a new job to be queued
+        # Release the semaphore to allow a new job to be queued
         semaphore.release()
 
-# --- 5. MODIFIED: Eager Processing Function ---
+# --- 4. MODIFIED: Eager Processing Function (with memory check) ---
 def run_eager_processing():
     """
     This is the main function that runs at startup.
@@ -252,8 +260,6 @@ def run_eager_processing():
     photo_data_map = {}
     
     if SHOULD_FETCH_NEW_RATINGS:
-        # --- This block now only runs if a flag is passed ---
-        
         device = get_auto_device()
         
         executor_cls = concurrent.futures.ThreadPoolExecutor
@@ -263,47 +269,41 @@ def run_eager_processing():
         print(f"Getting photo data in PARALLEL using {executor_cls.__name__} (device: {device}, max_workers: {MAX_WORKERS})...")
         start_time = time.time()
         
-        # --- 6. NEW: Bounded Queue Logic ---
+        # --- Bounded Queue Logic with Memory Check ---
         
-        # Use a Semaphore to limit the number of outstanding jobs
         queue_semaphore = threading.Semaphore(MAX_QUEUE_SIZE)
         results_lock = threading.Lock()
         failed_tasks = []
-        count = 0
         total_tasks = len(tasks)
+        all_futures = []
 
         with executor_cls(max_workers=MAX_WORKERS, initializer=init_worker) as executor:
             
-            # This is a list of all *pending* jobs
-            all_futures = []
-
             for task in tasks:
-                # 1. Wait if the queue is full (this throttles memory)
+                
+                # --- 5. NEW: MEMORY CHECK ---
+                # First, check if we have enough memory to even *queue* a new job
+                while psutil.virtual_memory().available < MIN_MEM_BYTES:
+                    available_gb = psutil.virtual_memory().available / 1024**3
+                    sys.stdout.write(f"\r[Memory Throttling] Waiting... (Available: {available_gb:.1f}GB, Need: {MIN_MEMORY_GB}GB)\n")
+                    sys.stdout.flush()
+                    time.sleep(2) # Wait 2 seconds
+                
+                # Now, wait for a *slot* in our bounded queue
                 queue_semaphore.acquire() 
                 
-                # 2. Submit the job
+                # We have memory and a slot, submit the job
                 future = executor.submit(get_photo_data_worker, task)
                 
-                # 3. Add a callback to run *when the job is done*
-                # This callback will release the semaphore
                 future.add_done_callback(
-                    # We use a lambda to pass *our* args, not just the future
                     lambda f, t=task: process_result_callback(
-                        f, t, photo_data_map, failed_tasks, results_lock, queue_semaphore
+                        f, t, photo_data_map, failed_tasks, results_lock, queue_semaphore, total_tasks
                     )
                 )
                 all_futures.append(future)
 
-            # Wait for all jobs to complete (all futures to be "done")
-            # We can print progress here while we wait
-            while count < total_tasks:
-                done_count = sum(1 for f in all_futures if f.done())
-                if done_count > count:
-                    count = done_count
-                    percent = (count / total_tasks) * 100
-                    sys.stdout.write(f"\r  ... Pass 1: Rated {count} / {total_tasks} ({percent:.1f}%) images.")
-                    sys.stdout.flush()
-                time.sleep(0.1) # Sleep to avoid pegging the CPU
+            # Wait for all futures to be completed
+            concurrent.futures.wait(all_futures)
 
         end_time = time.time()
         print(f"\nFinished Pass 1 in {end_time - start_time:.2f} seconds.")
@@ -311,14 +311,14 @@ def run_eager_processing():
         # --- Pass 2: Serial Retry (Unchanged) ---
         if failed_tasks:
             print(f"\nRetrying {len(failed_tasks)} failed images in SERIAL...")
-            if not aesthetic_model: init_worker() # Ensure model is loaded
+            if not aesthetic_model: init_worker()
             start_time_serial = time.time()
             for i, task in enumerate(failed_tasks):
                 filename = task[1]
                 try:
                     result = get_photo_data_worker(task)
                     photo_data_map[result['id']] = result
-                    sys.stdout.write(f"\r  ... Pass 2: Rerated {i + 1} / {len(failed_tasks)} ({filename})")
+                    sys.stdout.write(f"\r  ... Pass 2: Rerated {i + 1} / {len(failed_tasks)} ({filename}) - SUCCESS\n")
                     sys.stdout.flush()
                 except Exception as e:
                     print(f"\n[Serial Error] FAILED to process {filename} even in serial mode: {e}")
@@ -360,21 +360,16 @@ def index():
 
 @app.route('/api/photos')
 def get_photos():
-    """
-    This route is now very fast. It just serves the pre-computed data.
-    """
     global ALL_PHOTO_DATA
     return jsonify(ALL_PHOTO_DATA)
 
 
 if __name__ == '__main__':
-    # Set 'spawn' method for Linux/CUDA
-    if sys.platform != 'darwin': # 'darwin' is the name for macOS
+    if sys.platform != 'darwin':
         import multiprocessing
         if multiprocessing.get_start_method(allow_none=True) != 'spawn':
              multiprocessing.set_start_method('spawn', force=True)
     
-    # Run processing *before* the server
     run_eager_processing()
     
     app.run(debug=True)
