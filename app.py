@@ -3,6 +3,7 @@ import random
 import sys
 import concurrent.futures
 import json
+import time
 
 import pyiqa
 import torch
@@ -11,19 +12,20 @@ from flask import Flask, render_template, jsonify
 from PIL import Image, ImageOps, ExifTags
 
 # --- Configuration ---
-SOURCE_FOLDER = '/home/liam/Pictures/Backup/Panasonic G7/107_PANA'
+# !!! IMPORTANT: Update this path for your Mac !!!
+SOURCE_FOLDER = '/Users/liam/Pictures/my_panasonic_photos' # e.g.
 TARGET_FOLDER = 'photos/static/cropped_images'
 API_URL_BASE = 'static/cropped_images' 
 RATIO_H = 7 / 5
 RATIO_V = 5 / 7
 RATING_CACHE_FILE = 'photo_ratings.json' 
 
-# --- 1. NEW: RAM LIMIT ---
-# We're limiting the app to 4 parallel workers
-# to avoid overwhelming your 8GB of RAM.
-# You can try lowering this to 2 if it still crashes.
+# --- 1. MODIFIED: RAM Limit for Mac ---
+# This is the fix for the crash. We are limiting
+# the app to 4 parallel workers.
+# If it still crashes, try lowering this to 2.
 MAX_WORKERS = 4
-# --------------------------
+# --------------------------------------
 
 # --- Flask Setup ---
 app = Flask(
@@ -36,15 +38,12 @@ SHOULD_RELOAD_RATINGS = "--reload-ratings" in sys.argv
 SHOULD_FETCH_NEW_RATINGS = SHOULD_PROCESS_PHOTOS or SHOULD_RELOAD_RATINGS
 
 
-# --- Auto-Device Detection (Unchanged) ---
+# --- 2. MODIFIED: Mac-specific Device Detection ---
 def get_auto_device():
     """
-    Automatically detects and returns the best device (GPU or CPU).
+    Automatically detects and returns the best device (MPS or CPU).
     """
-    if torch.cuda.is_available():
-        print("Found CUDA/ROCm compatible GPU.")
-        return torch.device('cuda')
-    elif torch.backends.mps.is_available():
+    if torch.backends.mps.is_available():
         print("Found Apple Metal (MPS) GPU.")
         return torch.device('mps')
     else:
@@ -98,11 +97,8 @@ def process_single_image(source_tuple):
         print(f"Error processing {filename}: {e}")
         return None
 
-# --- process_images (MODIFIED) ---
+# --- 3. MODIFIED: process_images (RAM limit) ---
 def process_images():
-    """
-    Finds the list of images to display.
-    """
     if not os.path.exists(TARGET_FOLDER):
         os.makedirs(TARGET_FOLDER)
         print(f"Created directory: {TARGET_FOLDER}")
@@ -127,7 +123,7 @@ def process_images():
         source_files.sort(key=lambda x: x[1])
         print(f"Found {len(source_files)} images. Processing in PARALLEL...")
         
-        # --- 2. MODIFIED: Added max_workers ---
+        # Apply the MAX_WORKERS limit
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             results = list(executor.map(process_single_image, source_files))
         
@@ -151,32 +147,21 @@ def process_images():
 
 # --- get_local_rating (Unchanged) ---
 def get_local_rating(cropped_image_path):
-    """
-    Runs the local paq2piq model on an image and returns a 1-10 rating.
-    """
     if not aesthetic_model:
-        return random.randint(3, 7) # Fallback
+        return random.randint(3, 7)
     try:
         score_0_to_100 = aesthetic_model(cropped_image_path).item()
         rating = (score_0_to_100 / 100) * 9 + 1
         rating = round(rating, 1) 
-        print(f"Local model rated {os.path.basename(cropped_image_path)}: {rating}/10")
         return rating
     except Exception as e:
-        print(f"Error during local rating for {os.path.basename(cropped_image_path)}: {e}")
-        return 5 # Fallback on error
-
+        raise e
 
 # --- get_photo_data_worker (Unchanged) ---
 def get_photo_data_worker(task_tuple):
-    """
-    Worker task that gets orientation, metadata, AND local rating.
-    """
     i, filename, ratings_cache = task_tuple 
-    
     target_path = os.path.join(TARGET_FOLDER, filename)
     source_path = os.path.join(SOURCE_FOLDER, filename)
-    
     metadata = { "filename": filename, "model": "Unknown", "f_stop": "Unknown", "shutter_speed": "Unknown", "iso": "Unknown" }
     
     try:
@@ -200,8 +185,7 @@ def get_photo_data_worker(task_tuple):
         if 'orientation' not in locals():
             orientation = 'horizontal'
     
-    # --- RATING LOGIC ---
-    if filename in ratings_cache and not SHOULD_RELOAD_RATINGS: # <-- Logic fix
+    if filename in ratings_cache and not SHOULD_RELOAD_RATINGS:
         rating = ratings_cache[filename]
         new_rating = False
     else:
@@ -226,17 +210,17 @@ def get_photo_data_worker(task_tuple):
 def index():
     return render_template('index.html')
 
-# --- get_photos (MODIFIED) ---
+# --- MODIFIED: get_photos (with 2-Pass Retry Logic) ---
 @app.route('/api/photos')
 def get_photos():
     """
     This API now loads and saves the photo_ratings.json cache
-    using the 'pyiqa' local model.
+    and uses a 2-pass system to ensure all images are rated.
     """
     processed_files = process_images() 
     
     ratings_cache = {}
-    if not SHOULD_RELOAD_RATINGS: # <-- Logic fix
+    if not SHOULD_RELOAD_RATINGS:
         if os.path.exists(RATING_CACHE_FILE):
             try:
                 with open(RATING_CACHE_FILE, 'r') as f:
@@ -248,19 +232,74 @@ def get_photos():
         print("Reloading ratings: Starting with an empty cache.")
 
     tasks = [(i, filename, ratings_cache) for i, filename in enumerate(processed_files)]
-    photo_data = []
+    photo_data_map = {} 
+    
+    # --- 1. NEW: List to hold failed tasks for Pass 2 ---
+    failed_tasks = [] 
 
-    # --- DYNAMIC EXECUTOR SELECTION ---
-    if device.type == 'cpu' and SHOULD_FETCH_NEW_RATINGS:
-        executor_cls = concurrent.futures.ProcessPoolExecutor
-    else:
-        executor_cls = concurrent.futures.ThreadPoolExecutor
+    executor_cls = concurrent.futures.ThreadPoolExecutor
     
     if SHOULD_FETCH_NEW_RATINGS:
-        print(f"Getting photo data in PARALLEL using {executor_cls.__name__} (device: {device.type})...")
-        # --- 3. MODIFIED: Added max_workers ---
+        print(f"Getting photo data in PARALLEL using {executor_cls.__name__} (device: {device}, max_workers: {MAX_WORKERS})...")
+        start_time = time.time()
+
+        # --- PASS 1: PARALLEL ---
         with executor_cls(max_workers=MAX_WORKERS) as executor:
-            photo_data = list(executor.map(get_photo_data_worker, tasks))
+            
+            future_to_task = {
+                executor.submit(get_photo_data_worker, task): task 
+                for task in tasks
+            }
+            
+            count = 0
+            for future in concurrent.futures.as_completed(future_to_task):
+                task = future_to_task[future]
+                filename = task[1]
+                count += 1
+                
+                try:
+                    result = future.result()
+                    photo_data_map[result['id']] = result
+                    
+                    if count % 10 == 0 or count == len(tasks):
+                        percent = (count / len(tasks)) * 100
+                        sys.stdout.write(f"\r  ... Pass 1: Rated {count} / {len(tasks)} ({percent:.1f}%) images.")
+                        sys.stdout.flush()
+
+                except Exception as e:
+                    # --- 2. NEW: Add failed tasks to the retry list ---
+                    print(f"\n[Parallel Error] Failed to process {filename}. Adding to retry queue. Error: {e}")
+                    failed_tasks.append(task)
+            
+        end_time = time.time()
+        print(f"\nFinished Pass 1 in {end_time - start_time:.2f} seconds.")
+
+        # --- 3. NEW: PASS 2: SERIAL RETRY ---
+        if failed_tasks:
+            print(f"\nRetrying {len(failed_tasks)} failed images in SERIAL (this will be stable but slow)...")
+            start_time_serial = time.time()
+            
+            for i, task in enumerate(failed_tasks):
+                filename = task[1]
+                try:
+                    # Call the worker function directly, not in a pool
+                    result = get_photo_data_worker(task)
+                    photo_data_map[result['id']] = result
+                    sys.stdout.write(f"\r  ... Pass 2: Rerated {i + 1} / {len(failed_tasks)} ({filename})")
+                    sys.stdout.flush()
+                except Exception as e:
+                    # If it fails here, it's a permanent error
+                    print(f"\n[Serial Error] FAILED to process {filename} even in serial mode: {e}")
+
+            end_time_serial = time.time()
+            print(f"\nFinished Pass 2 in {end_time_serial - start_time_serial:.2f} seconds.")
+
+        # 4. Re-sort the data into a list
+        photo_data = [
+            photo_data_map[key] 
+            for key in sorted(photo_data_map.keys())
+        ]
+            
     else:
         print("Getting photo data in SERIAL (using cache)...")
         for task in tasks:
@@ -273,6 +312,7 @@ def get_photos():
             filename = data["metadata"]["filename"]
             ratings_cache[filename] = data["rating"]
             cache_updated = True
+        
         data.pop("new_rating_acquired", None) 
             
     if cache_updated:
@@ -287,4 +327,5 @@ def get_photos():
 
 
 if __name__ == '__main__':
+    # No 'spawn' method needed for Mac
     app.run(debug=True)
