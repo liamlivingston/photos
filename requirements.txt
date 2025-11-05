@@ -1,6 +1,6 @@
 Flask
 Pillow
-pyiqa
 torch
 torchvision
-psutil
+aesthetics-predictor
+open-clip-torch
