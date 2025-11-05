@@ -1,0 +1,52 @@
+body {
+    background-color: #1a1a1a;
+    margin: 0;
+    padding: 0;
+    overflow-x: hidden;
+}
+
+.gallery-container {
+    width: 100%;
+}
+
+.gallery-row {
+    display: flex;
+    width: 100%;
+    /* REMOVED: No fixed height. Height will be set by the content. */
+}
+
+.gallery-row img {
+    /* NEW: We use flex-grow to divide the space.
+       The JS will set this to '1' or '2'.
+    */
+    flex-grow: 1; /* Default value, will be overridden by JS */
+    
+    /* We set a 'flex-basis' of 0 to make the 'flex-grow'
+       calculation perfect.
+    */
+    flex-basis: 0;
+    
+    /* CRITICAL: Let the browser set the height automatically
+       based on the aspect-ratio.
+    */
+    height: auto;
+    
+    /* We set width to a small value (like 0) to help flexbox,
+       but 'flex-basis: 0' is the real key.
+    */
+    width: 0;
+
+    display: block;
+    
+    /* This prevents stretching if the image is an odd pixel size */
+    object-fit: cover;
+}
+
+/* NEW: Define the aspect ratios for the browser */
+.img-horizontal {
+    aspect-ratio: 1.41421 / 1; 
+}
+
+.img-vertical {
+    aspect-ratio: 1 / 1.41421;
+}
