@@ -8,3 +8,4 @@
 *.RW2
 *.rw2
 env/
+.DS_Store
