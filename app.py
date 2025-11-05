@@ -5,26 +5,22 @@ import concurrent.futures
 import json
 import time
 import threading
-# import psutil # <-- REMOVED
 
 import pyiqa
 import torch
+import torch.nn.functional as F  # 1. NEW IMPORT
 
 from flask import Flask, render_template, jsonify
 from PIL import Image, ImageOps, ExifTags
 
-# --- Configuration ---
+# --- Configuration (Unchanged) ---
 SOURCE_FOLDER = '/home/liam/Pictures/Backup/Panasonic G7/107_PANA'
 TARGET_FOLDER = 'photos/static/cropped_images'
 API_URL_BASE = 'static/cropped_images' 
 RATIO_H = 7 / 5
 RATIO_V = 5 / 7
 RATING_CACHE_FILE = 'photo_ratings.json' 
-
-# --- 1. MODIFIED: RAM Limit for Mac ---
-# Lowering to 2 workers to prevent OOM crash on 8GB RAM
-MAX_WORKERS = 2
-# MAX_QUEUE_SIZE = MAX_WORKERS * 2 # No longer needed
+MAX_WORKERS = 2 
 
 # --- Flask Setup (Unchanged) ---
 app = Flask(
@@ -53,16 +49,26 @@ def get_auto_device():
         print("No GPU found. Using CPU.")
         return torch.device('cpu')
 
-# --- Worker Initializer (Unchanged) ---
+# --- 2. MODIFIED: Worker Initializer (Switched to NIMA) ---
 def init_worker():
-    global aesthetic_model, device
+    """
+    Called by each new worker process. Loads one copy of the NIMA model.
+    """
+    global aesthetic_model, device, score_weights
+    
     device = get_auto_device() 
+    
     try:
-        print(f"[Worker {os.getpid()}]: Loading model onto {device}...")
-        aesthetic_model = pyiqa.create_metric('paq2piq', device=device)
-        print(f"[Worker {os.getpid()}]: Model loaded successfully.")
+        print(f"[Worker {os.getpid()}]: Loading NIMA model onto {device}...")
+        # *** We are now using the NIMA model ***
+        aesthetic_model = pyiqa.create_metric('nima-vgg16-ava', device=device)
+        
+        # Pre-calculate the 1-10 weights for the score
+        score_weights = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=torch.float32).to(device)
+        
+        print(f"[Worker {os.getpid()}]: NIMA model loaded successfully.")
     except Exception as e:
-        print(f"[Worker {os.getpid()}]: ERROR loading model: {e}")
+        print(f"[Worker {os.getpid()}]: ERROR loading NIMA model: {e}")
         aesthetic_model = None
 
 # --- Helper Functions (Unchanged) ---
@@ -147,18 +153,29 @@ def process_images():
 
     return processed_files
 
+# --- 3. MODIFIED: Local Rating Function (with NIMA math) ---
 def get_local_rating(cropped_image_path):
     if not aesthetic_model:
         print(f"[Worker {os.getpid()}]: Model is not loaded, returning random rating.")
         return random.randint(3, 7)
     try:
-        score_0_to_100 = aesthetic_model(cropped_image_path).item()
-        rating = (score_0_to_100 / 100) * 9 + 1
-        rating = round(rating, 1) 
+        # 1. Get the raw output (logits) from the model
+        score_distribution = aesthetic_model(cropped_image_path).squeeze()
+        
+        # 2. Apply softmax to convert logits to probabilities
+        # This is the step that was missing before.
+        probabilities = F.softmax(score_distribution, dim=0)
+        
+        # 3. Calculate the weighted mean
+        mean_score = (probabilities * score_weights).sum()
+        
+        # .item() pulls the number out of the PyTorch tensor
+        rating = round(mean_score.item(), 1) 
         return rating
     except Exception as e:
         raise e
 
+# --- get_photo_data_worker (Unchanged) ---
 def get_photo_data_worker(task_tuple):
     i, filename, ratings_cache = task_tuple 
     target_path = os.path.join(TARGET_FOLDER, filename)
@@ -206,12 +223,8 @@ def get_photo_data_worker(task_tuple):
         "metadata": metadata
     }
 
-# --- 3. MODIFIED: Eager Processing Function (psutil removed) ---
+# --- 4. MODIFIED: Eager Processing (uses correct executor) ---
 def run_eager_processing():
-    """
-    This is the main function that runs at startup.
-    It prepares all photo data and populates the global ALL_PHOTO_DATA.
-    """
     global ALL_PHOTO_DATA, device
     
     processed_files = process_images() 
@@ -232,16 +245,19 @@ def run_eager_processing():
     photo_data_map = {}
     
     if SHOULD_FETCH_NEW_RATINGS:
+        
         device = get_auto_device()
         
+        # --- Executor selection ---
         executor_cls = concurrent.futures.ThreadPoolExecutor
+        # Use ProcessPoolExecutor for CPU to bypass the GIL
         if device.type == 'cpu':
             executor_cls = concurrent.futures.ProcessPoolExecutor
 
         print(f"Getting photo data in PARALLEL using {executor_cls.__name__} (device: {device}, max_workers: {MAX_WORKERS})...")
         start_time = time.time()
         
-        # --- Back to the 2-Pass system ---
+        # --- 2-Pass system ---
         failed_tasks = []
 
         with executor_cls(max_workers=MAX_WORKERS, initializer=init_worker) as executor:
@@ -277,7 +293,7 @@ def run_eager_processing():
         # --- Pass 2: Serial Retry ---
         if failed_tasks:
             print(f"\nRetrying {len(failed_tasks)} failed images in SERIAL (this will be stable)...")
-            if not aesthetic_model: init_worker() # Ensure model is loaded
+            if not aesthetic_model: init_worker()
             start_time_serial = time.time()
             
             for i, task in enumerate(failed_tasks):
