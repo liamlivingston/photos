@@ -7,5 +7,7 @@
 *.nef
 *.RW2
 *.rw2
+*.AVIF
+*.avif
 env/
 .DS_Store
