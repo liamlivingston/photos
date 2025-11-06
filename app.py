@@ -101,7 +101,7 @@ def process_single_image(source_tuple):
 
     # Check if the compressed version already exists (primary check)
     if os.path.exists(compressed_target_path):
-        print(f"\nCompressed file {os.path.basename(compressed_target_path)} already exists, skipping processing for {filename}.")
+        # print(f"\nCompressed file {os.path.basename(compressed_target_path)} already exists, skipping processing for {filename}.")
         # --- MODIFIED: Return mtime with the filename ---
         return (os.path.basename(compressed_target_path), mtime) # Return the name of the compressed file generated
 
@@ -135,9 +135,6 @@ def process_single_image(source_tuple):
             cropped_img = center_crop(original_img_to_save, new_width, new_height)
 
             # Save cropped image as AVIF using pillow-avif-plugin
-            # AVIF compression settings can be adjusted (e.g., quality, speed)
-            # Here, we use default settings from Pillow's AVIF plugin
-            # You can add options like quality=80, speed=4 if supported by the plugin
             cropped_img.save(compressed_target_path, format="AVIF", quality=80) # Example quality setting
 
         # Update the global counter and lock it briefly
@@ -189,13 +186,8 @@ def process_images():
         rate_display_thread.start()
 
         try:
-            # Note: This uses ThreadPoolExecutor, which is suitable for I/O bound tasks
-            # like image loading and saving.
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 results = list(executor.map(process_single_image, source_files))
-
-            # Wait for the main processing to complete
-            # --- MODIFIED: processed_files is now a list of (filename, mtime) tuples ---
             processed_files = [f for f in results if f is not None]
 
         finally:
@@ -209,13 +201,10 @@ def process_images():
     else:
         print("Skipping photo processing. Scanning existing compressed AVIF images...")
         try:
-            # Scan the COMPRESSED_SUBFOLDER for .avif files
             for filename in os.listdir(os.path.join(TARGET_FOLDER, COMPRESSED_SUBFOLDER)):
                 if (not filename.startswith('._') and
                     filename.lower().endswith('.avif')): # Check for .avif extension
                     
-                    # --- MODIFIED: Need to get mtime for existing files ---
-                    # We will get it from the *original* file copy, if it exists
                     original_file_path = os.path.join(TARGET_FOLDER, ORIGINAL_SUBFOLDER, f"{os.path.splitext(filename)[0]}.JPG")
                     mtime = 0 # Default mtime if original is missing
                     if os.path.exists(original_file_path):
@@ -225,7 +214,6 @@ def process_images():
                     
                     processed_files.append((filename, mtime)) # Append tuple (filename, mtime)
             
-            # Sort by mtime (date) ascending, which is the default
             processed_files.sort(key=lambda x: x[1]) 
             print(f"Found {len(processed_files)} existing compressed AVIF images.")
         except FileNotFoundError:
@@ -236,28 +224,28 @@ def process_images():
 
 # --- Updated get_photo_data_worker ---
 def get_photo_data_worker(task_tuple):
-    # --- MODIFIED: Unpack mtime ---
     i, filename, mtime, ratings_cache = task_tuple
-    # The filename now refers to the compressed AVIF file
     compressed_filename = filename
-    # The original filename is the AVIF name without extension, plus .JPG
     original_filename = f"{os.path.splitext(filename)[0]}.JPG"
 
-    # Paths for the compressed (AVIF) and original (JPG) files
     compressed_target_path = os.path.join(TARGET_FOLDER, COMPRESSED_SUBFOLDER, compressed_filename)
     original_source_path = os.path.join(SOURCE_FOLDER, original_filename) # Path to original in source folder
 
     metadata = { "filename": compressed_filename, "model": "Unknown", "f_stop": "Unknown", "shutter_speed": "Unknown", "iso": "Unknown" }
+    orientation = 'horizontal' # Default
 
     try:
         # Load metadata from the original source image (JPG)
         if os.path.exists(original_source_path):
             with Image.open(original_source_path) as img:
                 width, height = img.size
-                orientation = 'horizontal' if width > height else 'vertical'
-
+                
+                # --- CORRECTED ORIENTATION LOGIC ---
+                orientation_tag = None
                 exif_data = img.getexif()
+                
                 if exif_data:
+                    orientation_tag = exif_data.get(0x0112) # 0x0112 = Orientation tag
                     exif = { ExifTags.TAGS[k]: v for k, v in exif_data.items() if k in ExifTags.TAGS }
                     metadata["model"] = exif.get("Model", "Unknown")
                     metadata["f_stop"] = f"f/{exif.get('FNumber', 'N/A')}"
@@ -265,6 +253,15 @@ def get_photo_data_worker(task_tuple):
                     if ss > 0:
                         metadata["shutter_speed"] = f"1/{round(1/ss)}s" if ss < 1 else f"{ss}s"
                     metadata["iso"] = exif.get("ISOSpeedRatings", "N/A")
+                
+                # Tags 5, 6, 7, 8 mean the camera was held vertically
+                if orientation_tag in [5, 6, 7, 8]:
+                    orientation = 'vertical'
+                else:
+                    # Tags 1-4 or None, use pixel dimensions (which are pre-rotation)
+                    orientation = 'horizontal' if width > height else 'vertical'
+                # --- END CORRECTED LOGIC ---
+
         else:
             print(f"Warning: Original source file {original_source_path} not found for metadata extraction.")
             # Fallback to get dimensions from the compressed AVIF if source is missing
@@ -273,34 +270,32 @@ def get_photo_data_worker(task_tuple):
                  orientation = 'horizontal' if width > height else 'vertical'
     except Exception as e:
         print(f"Error reading metadata for {compressed_filename} (from source {original_source_path}): {e}")
-        # Set a default orientation if dimensions couldn't be read
-        orientation = 'horizontal'
+        orientation = 'horizontal' # Keep default on error
 
-    # Determine rating logic (same as before, but filename refers to AVIF now)
+    # Determine rating logic
     cache_key = compressed_filename.replace("avif", "JPG")
     if cache_key in ratings_cache and not SHOULD_FETCH_NEW_RATINGS:
-        rating = float(ratings_cache[cache_key]) # --- MODIFIED: Convert to float ---
+        rating = float(ratings_cache[cache_key]) 
         new_rating = False
     elif cache_key in ratings_cache and SHOULD_FETCH_NEW_RATINGS:
-        rating = float(ratings_cache[cache_key]) # --- MODIFIED: Convert to float ---
+        rating = float(ratings_cache[cache_key])
         new_rating = False
     else:
         if SHOULD_FETCH_NEW_RATINGS:
-            rating = -1.0 # --- MODIFIED: Use float ---
+            rating = -1.0 
             new_rating = True
-            print(f"Fetching new rating for {compressed_filename}...")
+            # print(f"Fetching new rating for {compressed_filename}...")
         else:
-            rating = -1.0 # --- MODIFIED: Use float ---
+            rating = -1.0 
             new_rating = False
-            print(f"Assigning default rating for {compressed_filename}...")
+            # print(f"Assigning default rating for {compressed_filename}...")
 
     return {
         "id": i + 1,
         "rating": rating,
-        "mtime": mtime, # --- MODIFIED: Add mtime ---
+        "mtime": mtime, 
         "new_rating_acquired": new_rating,
         "orientation": orientation,
-        # The URL now points to the compressed AVIF file
         "url": f"/{API_URL_BASE}/{COMPRESSED_SUBFOLDER}/{compressed_filename}",
         "metadata": metadata
     }
@@ -314,10 +309,9 @@ def run_eager_processing():
     """
     global ALL_PHOTO_DATA
 
-    processed_files = process_images() # --- This is now a list of (filename, mtime) tuples ---
+    processed_files = process_images() # This is now a list of (filename, mtime) tuples
 
     ratings_cache = {}
-    # SHOULD_RELOAD_RATINGS removed: Always load cache if it exists when not processing fresh
     if os.path.exists(RATING_CACHE_FILE):
         try:
             with open(RATING_CACHE_FILE, 'r') as f:
@@ -325,39 +319,29 @@ def run_eager_processing():
                 print(f"Loaded {len(ratings_cache)} ratings from cache.")
         except Exception as e:
             print(f"Error loading rating cache: {e}")
-    # else: print("No rating cache file found, will start fresh or assign defaults.")
 
-    # --- MODIFIED: Pass mtime into the task tuple ---
     tasks = [(i, file_tuple[0], file_tuple[1], ratings_cache) for i, file_tuple in enumerate(processed_files)]
     photo_data_map = {}
 
     if SHOULD_FETCH_NEW_RATINGS:
-        # Use ThreadPoolExecutor (correct for Mac + I/O bound tasks like metadata reading)
         executor_cls = concurrent.futures.ThreadPoolExecutor
-
         print(f"Getting photo data in PARALLEL using {executor_cls.__name__} (max_workers: {MAX_WORKERS})...")
         start_time_meta = time.time()
-
-        # --- 2-Pass system ---
         failed_tasks = []
 
         with executor_cls(max_workers=MAX_WORKERS) as executor:
-
             future_to_task = {
                 executor.submit(get_photo_data_worker, task): task
                 for task in tasks
             }
-
             count = 0
             for future in concurrent.futures.as_completed(future_to_task):
                 task = future_to_task[future]
                 filename = task[1]
                 count += 1
-
                 try:
                     result = future.result()
                     photo_data_map[result['id']] = result
-
                 except Exception as e:
                     print(f"\n[Parallel Error] Failed to process {filename}. Adding to retry queue. Error: {e}\n")
                     failed_tasks.append(task)
@@ -365,11 +349,9 @@ def run_eager_processing():
         end_time_meta = time.time()
         print(f"\nFinished Pass 1 (metadata/rating) in {end_time_meta - start_time_meta:.2f} seconds.")
 
-        # --- Pass 2: Serial Retry ---
         if failed_tasks:
             print(f"\nRetrying {len(failed_tasks)} failed images in SERIAL (this will be stable)...")
             start_time_serial = time.time()
-
             for i, task in enumerate(failed_tasks):
                 filename = task[1]
                 try:
@@ -377,7 +359,6 @@ def run_eager_processing():
                     photo_data_map[result['id']] = result
                 except Exception as e:
                     print(f"\n[Serial Error] FAILED to process {filename} even in serial mode: {e}")
-
             end_time_serial = time.time()
             print(f"\nFinished Pass 2 in {end_time_serial - start_time_serial:.2f} seconds.")
 
@@ -385,18 +366,14 @@ def run_eager_processing():
         # --- FAST LAUNCH path ---
         print("Getting photo data in SERIAL (using cache or assigning defaults)...")
         for task in tasks:
-            # --- MODIFIED: task[0] is the id (i), not the filename ---
             photo_data_map[task[0]+1] = get_photo_data_worker(task) # Use id (i+1) as key
 
     # --- Final Processing ---
-    # --- MODIFIED: Ensure we sort by ID to build the list, as tasks may finish out of order ---
     ALL_PHOTO_DATA = [ photo_data_map[key] for key in sorted(photo_data_map.keys()) ]
 
     cache_updated = False
     for data in ALL_PHOTO_DATA:
         if data.get("new_rating_acquired", False):
-            # The key in the cache is the name of the compressed AVIF file
-            # --- MODIFIED: The cache key should be the original JPG name ---
             filename_jpg = f"{os.path.splitext(data['metadata']['filename'])[0]}.JPG"
             ratings_cache[filename_jpg] = data["rating"]
             cache_updated = True
@@ -421,11 +398,9 @@ def index():
 @app.route('/api/photos')
 def get_photos():
     global ALL_PHOTO_DATA
-    # --- MODIFIED: The frontend will handle sorting, just send the data ---
     return jsonify(ALL_PHOTO_DATA)
 
 
 if __name__ == '__main__':
-    # Removed all Linux 'spawn' logic
     run_eager_processing()
     app.run(debug=True)
