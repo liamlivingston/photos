@@ -93,7 +93,7 @@ def center_crop(img, crop_width, crop_height):
     return img.crop((left, top, right, bottom))
 
 def process_single_image(source_tuple):
-    source_path, mtime = source_tuple
+    source_path, mtime = source_tuple # --- MODIFIED: Unpack mtime ---
     filename = os.path.basename(source_path)
     # Define paths for the output files in their respective subfolders
     original_target_path = os.path.join(TARGET_FOLDER, ORIGINAL_SUBFOLDER, filename)
@@ -102,7 +102,8 @@ def process_single_image(source_tuple):
     # Check if the compressed version already exists (primary check)
     if os.path.exists(compressed_target_path):
         print(f"\nCompressed file {os.path.basename(compressed_target_path)} already exists, skipping processing for {filename}.")
-        return os.path.basename(compressed_target_path) # Return the name of the compressed file generated
+        # --- MODIFIED: Return mtime with the filename ---
+        return (os.path.basename(compressed_target_path), mtime) # Return the name of the compressed file generated
 
     # Create subdirectories if they don't exist
     os.makedirs(os.path.join(TARGET_FOLDER, ORIGINAL_SUBFOLDER), exist_ok=True)
@@ -143,8 +144,9 @@ def process_single_image(source_tuple):
         with current_processed_lock:
             global current_processed_count
             current_processed_count += 1
-
-        return os.path.basename(compressed_target_path) # Return the name of the *compressed* file generated
+        
+        # --- MODIFIED: Return mtime with the filename ---
+        return (os.path.basename(compressed_target_path), mtime) # Return the name of the *compressed* file generated
     except Exception as e:
         print(f"\nError processing {filename}: {e}")
         return None
@@ -193,6 +195,7 @@ def process_images():
                 results = list(executor.map(process_single_image, source_files))
 
             # Wait for the main processing to complete
+            # --- MODIFIED: processed_files is now a list of (filename, mtime) tuples ---
             processed_files = [f for f in results if f is not None]
 
         finally:
@@ -210,8 +213,20 @@ def process_images():
             for filename in os.listdir(os.path.join(TARGET_FOLDER, COMPRESSED_SUBFOLDER)):
                 if (not filename.startswith('._') and
                     filename.lower().endswith('.avif')): # Check for .avif extension
-                    processed_files.append(filename) # Append the name of the AVIF file
-            processed_files.sort()
+                    
+                    # --- MODIFIED: Need to get mtime for existing files ---
+                    # We will get it from the *original* file copy, if it exists
+                    original_file_path = os.path.join(TARGET_FOLDER, ORIGINAL_SUBFOLDER, f"{os.path.splitext(filename)[0]}.JPG")
+                    mtime = 0 # Default mtime if original is missing
+                    if os.path.exists(original_file_path):
+                        mtime = os.path.getmtime(original_file_path)
+                    elif os.path.exists(os.path.join(TARGET_FOLDER, COMPRESSED_SUBFOLDER, filename)):
+                        mtime = os.path.getmtime(os.path.join(TARGET_FOLDER, COMPRESSED_SUBFOLDER, filename))
+                    
+                    processed_files.append((filename, mtime)) # Append tuple (filename, mtime)
+            
+            # Sort by mtime (date) ascending, which is the default
+            processed_files.sort(key=lambda x: x[1]) 
             print(f"Found {len(processed_files)} existing compressed AVIF images.")
         except FileNotFoundError:
             print(f"Warning: Compressed sub-folder not found at {os.path.join(TARGET_FOLDER, COMPRESSED_SUBFOLDER)}")
@@ -221,7 +236,8 @@ def process_images():
 
 # --- Updated get_photo_data_worker ---
 def get_photo_data_worker(task_tuple):
-    i, filename, ratings_cache = task_tuple
+    # --- MODIFIED: Unpack mtime ---
+    i, filename, mtime, ratings_cache = task_tuple
     # The filename now refers to the compressed AVIF file
     compressed_filename = filename
     # The original filename is the AVIF name without extension, plus .JPG
@@ -261,25 +277,27 @@ def get_photo_data_worker(task_tuple):
         orientation = 'horizontal'
 
     # Determine rating logic (same as before, but filename refers to AVIF now)
-    if compressed_filename.replace("avif", "JPG") in ratings_cache and not SHOULD_FETCH_NEW_RATINGS:
-        rating = ratings_cache[compressed_filename.replace("avif", "JPG")]
+    cache_key = compressed_filename.replace("avif", "JPG")
+    if cache_key in ratings_cache and not SHOULD_FETCH_NEW_RATINGS:
+        rating = float(ratings_cache[cache_key]) # --- MODIFIED: Convert to float ---
         new_rating = False
-    elif compressed_filename.replace("avif", "JPG") in ratings_cache and SHOULD_FETCH_NEW_RATINGS:
-        rating = ratings_cache[compressed_filename.replace("avif", "JPG")]
+    elif cache_key in ratings_cache and SHOULD_FETCH_NEW_RATINGS:
+        rating = float(ratings_cache[cache_key]) # --- MODIFIED: Convert to float ---
         new_rating = False
     else:
         if SHOULD_FETCH_NEW_RATINGS:
-            rating = -1 # Placeholder for new rating logic
+            rating = -1.0 # --- MODIFIED: Use float ---
             new_rating = True
             print(f"Fetching new rating for {compressed_filename}...")
         else:
-            rating = -1 # Default rating when not fetching new ratings
+            rating = -1.0 # --- MODIFIED: Use float ---
             new_rating = False
             print(f"Assigning default rating for {compressed_filename}...")
 
     return {
         "id": i + 1,
         "rating": rating,
+        "mtime": mtime, # --- MODIFIED: Add mtime ---
         "new_rating_acquired": new_rating,
         "orientation": orientation,
         # The URL now points to the compressed AVIF file
@@ -296,7 +314,7 @@ def run_eager_processing():
     """
     global ALL_PHOTO_DATA
 
-    processed_files = process_images()
+    processed_files = process_images() # --- This is now a list of (filename, mtime) tuples ---
 
     ratings_cache = {}
     # SHOULD_RELOAD_RATINGS removed: Always load cache if it exists when not processing fresh
@@ -309,7 +327,8 @@ def run_eager_processing():
             print(f"Error loading rating cache: {e}")
     # else: print("No rating cache file found, will start fresh or assign defaults.")
 
-    tasks = [(i, filename, ratings_cache) for i, filename in enumerate(processed_files)]
+    # --- MODIFIED: Pass mtime into the task tuple ---
+    tasks = [(i, file_tuple[0], file_tuple[1], ratings_cache) for i, file_tuple in enumerate(processed_files)]
     photo_data_map = {}
 
     if SHOULD_FETCH_NEW_RATINGS:
@@ -366,17 +385,20 @@ def run_eager_processing():
         # --- FAST LAUNCH path ---
         print("Getting photo data in SERIAL (using cache or assigning defaults)...")
         for task in tasks:
-            photo_data_map[task[0]] = get_photo_data_worker(task)
+            # --- MODIFIED: task[0] is the id (i), not the filename ---
+            photo_data_map[task[0]+1] = get_photo_data_worker(task) # Use id (i+1) as key
 
     # --- Final Processing ---
+    # --- MODIFIED: Ensure we sort by ID to build the list, as tasks may finish out of order ---
     ALL_PHOTO_DATA = [ photo_data_map[key] for key in sorted(photo_data_map.keys()) ]
 
     cache_updated = False
     for data in ALL_PHOTO_DATA:
         if data.get("new_rating_acquired", False):
             # The key in the cache is the name of the compressed AVIF file
-            filename = data["metadata"]["filename"]
-            ratings_cache[filename] = data["rating"]
+            # --- MODIFIED: The cache key should be the original JPG name ---
+            filename_jpg = f"{os.path.splitext(data['metadata']['filename'])[0]}.JPG"
+            ratings_cache[filename_jpg] = data["rating"]
             cache_updated = True
         data.pop("new_rating_acquired", None)
 
@@ -399,6 +421,7 @@ def index():
 @app.route('/api/photos')
 def get_photos():
     global ALL_PHOTO_DATA
+    # --- MODIFIED: The frontend will handle sorting, just send the data ---
     return jsonify(ALL_PHOTO_DATA)
 
 
