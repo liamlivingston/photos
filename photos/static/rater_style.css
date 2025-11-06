@@ -1,0 +1,108 @@
+/* Global styles */
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background-color: #1a1a1a;
+    color: #f1f1f1;
+    margin: 0;
+    padding: 0;
+    text-align: center;
+    overflow: hidden; /* Prevent scrollbars */
+}
+
+h1 {
+    margin: 0.5em 0 0.2em 0;
+    font-weight: 300;
+}
+
+p {
+    margin-top: 0;
+    color: #aaa;
+}
+
+/* Main container for the two images */
+.rater-container {
+    display: flex;
+    width: 100vw;
+    height: 75vh; /* 75% of the viewport height */
+    margin-top: 1em;
+}
+
+/* Wrapper for each image */
+.image-wrapper {
+    flex: 1; /* Each wrapper takes up 50% of the space */
+    position: relative;
+    overflow: hidden;
+    cursor: pointer;
+    background-color: #000;
+    transition: transform 0.2s ease, filter 0.2s ease;
+}
+
+.image-wrapper img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain; /* Show the whole image, don't crop */
+    transition: transform 0.2s ease;
+}
+
+/* Hover overlay text */
+.vote-overlay {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    background: linear-gradient(0deg, rgba(0,0,0,0.8) 0%, rgba(0,0,0,0) 100%);
+    color: white;
+    text-align: center;
+    padding: 2em 1em 1em 1em;
+    font-size: 1.2em;
+    font-weight: 600;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+    pointer-events: none; /* Allows clicks to go through to the wrapper */
+}
+
+.image-wrapper:hover .vote-overlay {
+    opacity: 1;
+}
+
+.image-wrapper:hover img {
+    transform: scale(1.02);
+}
+
+/* Add a subtle "dimming" effect on the non-hovered image */
+.rater-container:hover .image-wrapper:not(:hover) {
+    transform: scale(0.98);
+    filter: brightness(0.7);
+}
+
+
+/* Controls at the bottom */
+.controls {
+    text-align: center;
+    margin-top: 1.5em;
+}
+
+.stats {
+    color: #aaa;
+    margin-top: 1em;
+}
+
+button {
+    font-size: 1em;
+    padding: 0.8em 1.5em;
+    background-color: #333;
+    color: #f1f1f1;
+    border: 1px solid #555;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background-color 0.2s ease;
+}
+
+button:hover:not(:disabled) {
+    background-color: #444;
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}

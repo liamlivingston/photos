@@ -400,7 +400,6 @@ def get_photos():
     global ALL_PHOTO_DATA
     return jsonify(ALL_PHOTO_DATA)
 
-
 if __name__ == '__main__':
     run_eager_processing()
     app.run(debug=True)

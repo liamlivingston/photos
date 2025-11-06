@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Rater</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='rater_style.css') }}">
+</head>
+<body>
+
+    <h1>Which Photo is Better?</h1>
+    <p>Use <strong>Left/Right Arrow Keys</strong> or Click to Vote</p>
+
+    <div class="rater-container">
+        <div class="image-wrapper" id="image-a-wrapper">
+            <img id="image-a" src="https://placehold.co/800x600/333/555?text=Loading..." alt="Image A">
+            <div class="vote-overlay">
+                <span>(Left Arrow)</span>
+            </div>
+        </div>
+        <div class="image-wrapper" id="image-b-wrapper">
+            <img id="image-b" src="https://placehold.co/800x600/333/555?text=Loading..." alt="Image B">
+            <div class="vote-overlay">
+                <span>(Right Arrow)</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button id="undo-button" disabled>Undo Last Vote (Backspace)</button>
+    </div>
+
+    <div classs="stats">
+        Total Votes: <span id="total-votes">{{ total_votes }}</span>
+    </div>
+
+    <script src="{{ url_for('static', filename='rater_script.js') }}" defer></script>
+</body>
+</html>
