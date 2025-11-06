@@ -17,10 +17,10 @@ RATING_CACHE_FILE = 'photo_ratings.json'
 
 # Sub-folder names
 ORIGINAL_SUBFOLDER = 'original'
-COMPRESSED_SUBFOLDER = 'compressed' # Subfolder for AVIF files
+COMPRESSED_SUBFOLDER = 'compressed_avif' # Subfolder for AVIF files
 
 # Set based on your system's capabilities for I/O bound tasks
-MAX_WORKERS = 8 # Adjust if needed based on performance/RAM
+MAX_WORKERS = 2 # Adjust if needed based on performance/RAM
 
 # --- Flask Setup ---
 app = Flask(
@@ -261,19 +261,21 @@ def get_photo_data_worker(task_tuple):
         orientation = 'horizontal'
 
     # Determine rating logic (same as before, but filename refers to AVIF now)
-    if compressed_filename in ratings_cache and not SHOULD_FETCH_NEW_RATINGS:
-        rating = ratings_cache[compressed_filename]
+    if compressed_filename.replace("avif", "JPG") in ratings_cache and not SHOULD_FETCH_NEW_RATINGS:
+        rating = ratings_cache[compressed_filename.replace("avif", "JPG")]
         new_rating = False
-    elif compressed_filename in ratings_cache and SHOULD_FETCH_NEW_RATINGS:
-        rating = ratings_cache[compressed_filename]
+    elif compressed_filename.replace("avif", "JPG") in ratings_cache and SHOULD_FETCH_NEW_RATINGS:
+        rating = ratings_cache[compressed_filename.replace("avif", "JPG")]
         new_rating = False
     else:
         if SHOULD_FETCH_NEW_RATINGS:
-            rating = random.randint(3, 7)
+            rating = -1 # Placeholder for new rating logic
             new_rating = True
+            print(f"Fetching new rating for {compressed_filename}...")
         else:
-            rating = 5
+            rating = -1 # Default rating when not fetching new ratings
             new_rating = False
+            print(f"Assigning default rating for {compressed_filename}...")
 
     return {
         "id": i + 1,

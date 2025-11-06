@@ -18,10 +18,10 @@ RATING_CACHE_FILE = 'photo_ratings.json'
 
 # Sub-folder names
 ORIGINAL_SUBFOLDER = 'original'
-COMPRESSED_SUBFOLDER = 'compressed'
+COMPRESSED_SUBFOLDER = 'compressed_avif'
 
 # Set to 2 to prevent OOM crash on 8GB RAM
-MAX_WORKERS = 2 
+MAX_WORKERS = 16
 
 # --- Flask Setup ---
 app = Flask(
