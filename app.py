@@ -10,7 +10,7 @@ from flask import Flask, render_template, jsonify
 from PIL import Image, ImageOps, ExifTags # ExifTags imported
 
 # --- Configuration ---
-SOURCE_FOLDER = 'cropped_images' # Source folder containing original images
+SOURCE_FOLDER = '/home/liam/Pictures/Backup/Panasonic G7/107_PANA' # Source folder containing original images
 TARGET_FOLDER = 'photos/static/cropped_images' # Main target folder (will contain 'original' and 'compressed' subfolders)
 API_URL_BASE = 'static/cropped_images'
 RATING_CACHE_FILE = 'photo_ratings.json'
@@ -20,7 +20,7 @@ ORIGINAL_SUBFOLDER = 'original'
 COMPRESSED_SUBFOLDER = 'compressed_avif' # Subfolder for AVIF files
 
 # Set based on your system's capabilities for I/O bound tasks
-MAX_WORKERS = 2 # Adjust if needed based on performance/RAM
+MAX_WORKERS = 16 # Adjust if needed based on performance/RAM
 
 # --- Flask Setup ---
 app = Flask(

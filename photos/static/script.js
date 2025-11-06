@@ -72,7 +72,7 @@ document.addEventListener('DOMContentLoaded', () => {
         
         if (!currentPhoto) return;
 
-        lightboxImg.src = currentPhoto.url.replace(/\/compressed_avif\//, '/original/').replace(/\.avif$/i, '.jpg');// Set the image
+        lightboxImg.src = currentPhoto.url.replace(/\/compressed_avif\//, '/original/').replace(/\.avif$/i, '.JPG');// Set the image
         lightbox.classList.add('show');      // Show the overlay
         
         // Prevent body from scrolling underneath
