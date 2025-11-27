@@ -11,7 +11,7 @@ from flask import Flask, render_template, jsonify
 from PIL import Image, ImageOps, ExifTags
 
 # --- Configuration ---
-SOURCE_FOLDER = 'cropped_images'
+SOURCE_FOLDER = 'photos/lumix'
 TARGET_FOLDER = 'photos/static/cropped_images'
 API_URL_BASE = 'static/cropped_images' 
 RATING_CACHE_FILE = 'photo_ratings.json' 
@@ -267,7 +267,7 @@ def get_photo_data_worker(task_tuple):
                 orientation = 'horizontal' if width > height else 'vertical'
                 
                 exif_data = img.getexif()
-                if exif_
+                if exif:
                     exif = { ExifTags.TAGS[k]: v for k, v in exif_data.items() if k in ExifTags.TAGS }
                     metadata["model"] = exif.get("Model", "Unknown")
                     metadata["f_stop"] = f"f/{exif.get('FNumber', 'N/A')}"

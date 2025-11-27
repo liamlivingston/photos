@@ -5,3 +5,4 @@ torchvision
 aesthetic-predictor-v2-5
 open-clip-torch
 pillow-avif-plugin
+PyExifTool
