@@ -9,6 +9,8 @@
 *.rw2
 *.AVIF
 *.avif
+*.MP4
+*.MOV
 env/
 .DS_Store
 .github/copilot-instructions.md

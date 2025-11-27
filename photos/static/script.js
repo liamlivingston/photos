@@ -12,7 +12,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const prevButton = document.getElementById('prev-button');
     const nextButton = document.getElementById('next-button');
     
-    // --- NEW: Get sort UI references ---
+    // --- Get sort UI references ---
     const sortKeySelect = document.getElementById('sort-key');
     const sortDirSelect = document.getElementById('sort-dir');
     
@@ -32,13 +32,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
         rowPhotos.forEach(photo => {
             const img = document.createElement('img');
-            img.src = photo.url;
+            img.src = photo.url; // Use the compressed AVIF URL for the grid
             img.alt = `Photo ${photo.id}`;
             
             const isHorizontal = (photo.orientation === 'horizontal');
             img.className = isHorizontal ? 'img-horizontal' : 'img-vertical';
             img.style.flexGrow = isHorizontal ? '2' : '1';
-
+            
             img.dataset.photoId = photo.id; // Store ID for lookup
             img.addEventListener('click', openLightbox);
             
@@ -70,7 +70,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    // --- NEW: Main function to sort the data and re-render the gallery ---
+    // --- Main function to sort the data and re-render the gallery ---
     function applySortAndRender() {
         const key = sortKeySelect.value;
         const dir = sortDirSelect.value;
@@ -83,9 +83,9 @@ document.addEventListener('DOMContentLoaded', () => {
             if (key === 'rating') {
                 valA = a.rating;
                 valB = b.rating;
-            } else if (key === 'mtime') {
-                valA = a.mtime;
-                valB = b.mtime;
+            } else if (key === 'date') { // --- MODIFIED: Use new date field ---
+                valA = a.date_for_sort;
+                valB = b.date_for_sort;
             } else { // 'filename'
                 valA = a.metadata.filename.toLowerCase();
                 valB = b.metadata.filename.toLowerCase();
@@ -120,7 +120,8 @@ document.addEventListener('DOMContentLoaded', () => {
         currentPhotoIndex = index;
         currentPhoto = allPhotosData[currentPhotoIndex];
         
-        // Set the image (using original, high-res path)
+        // --- THIS IS THE ORIGINAL IMAGE LOGIC ---
+        // It correctly replaces the .avif URL with the .JPG URL
         lightboxImg.src = currentPhoto.url.replace(/\/compressed_avif\//, '/original/').replace(/\.avif$/i, '.JPG');
         
         // If metadata sidebar is open, update it
@@ -185,13 +186,28 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
     
+    // --- MODIFIED: Updated populateMetadata ---
     function populateMetadata(photo) {
         const meta = photo.metadata;
+        
+        // Format the date string
+        let dateStr = "Unknown";
+        if (meta.date_taken) {
+            // EXIF dates are 'YYYY:MM:DD HH:MM:SS'. Need to replace colons in date part for JS.
+            const parts = meta.date_taken.split(' ');
+            const datePart = parts[0].replace(/:/g, '/');
+            dateStr = new Date(datePart + ' ' + parts[1]).toLocaleString();
+        } else {
+            // Fall back to file modification time
+            dateStr = new Date(photo.mtime * 1000).toLocaleString();
+        }
+
         // Build simple HTML for the metadata
+        // meta.filename is now the original JPG filename (from app.py)
         metadataContent.innerHTML = `
             <p><strong>Filename</strong> ${meta.filename}</p>
-            <p><strong>Rating</strong> ${Number.parseFloat(photo.rating).toFixed(2)} / 10</p>
-            <p><strong>Date</strong> ${new Date(photo.mtime * 1000).toLocaleString()}</p>
+            <p><strong>Date Taken</strong> ${dateStr}</p>
+            <p><strong>Rating</strong> ${photo.rating < 0 ? 'Not Rated' : Number.parseFloat(photo.rating).toFixed(2) + ' / 10'}</p>
             <p><strong>Model</strong> ${meta.model}</p>
             <p><strong>F-Stop</strong> ${meta.f_stop}</p>
             <p><strong>Shutter Speed</strong> ${meta.shutter_speed}</p>
@@ -216,7 +232,7 @@ document.addEventListener('DOMContentLoaded', () => {
     prevButton.addEventListener('click', showPrevPhoto);
     nextButton.addEventListener('click', showNextPhoto);
     
-    // --- NEW: Add sort UI listeners ---
+    // --- Add sort UI listeners ---
     sortKeySelect.addEventListener('change', applySortAndRender);
     sortDirSelect.addEventListener('change', applySortAndRender);
     
@@ -233,10 +249,9 @@ document.addEventListener('DOMContentLoaded', () => {
         .then(photos => {
             allPhotosData = photos; // Store photos
             
-            // --- NEW: Apply default sort and render ---
-            // The API provides data sorted by date ascending.
-            // We will set the UI to "Date" and "Descending" and apply it.
-            sortKeySelect.value = 'mtime';
+            // --- MODIFIED: Update sort key value to 'date' ---
+            // Set the UI to "Date" and "Descending" and apply it.
+            sortKeySelect.value = 'date';
             sortDirSelect.value = 'desc';
             applySortAndRender(); 
         })
